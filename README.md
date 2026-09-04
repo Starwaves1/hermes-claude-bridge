@@ -4,10 +4,9 @@ Use your Claude subscription with Hermes, within the Claude subscription TOS
 (as of 2026-09-03), via the Agent SDK and `claude -p`, to give an
 OpenAI-compatible endpoint which harnesses such as Hermes Agent can use.
 
-**READ THE CLAUDE TOS BEFORE USING.** Do NOT hammer it. If you schedule
-heartbeats or cron jobs through it, keep them to every 15 minutes or slower.
-Don't spread it across multiple users. Use it for modest individual purposes
-only. Please don't ruin it.
+**READ THE CLAUDE TOS BEFORE USING.** Do NOT hammer it. Schedule heartbeats
+every 15 minutes. Don't spread it across multiple users. Use it for modest
+individual purposes only. Please don't ruin it.
 
 Single user. No legal assurances. Not a recommendation. This is just me
 sharing my code. Probably don't use this in business contexts. Don't abuse
