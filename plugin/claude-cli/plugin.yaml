@@ -1,0 +1,5 @@
+name: claude-cli
+kind: model-provider
+version: 1.1.0
+description: Claude via the local claude -p binary (subscription); bridge on 127.0.0.1:8790, tools stay in Hermes
+author: Starwaves1
