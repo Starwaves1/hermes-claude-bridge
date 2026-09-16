@@ -376,3 +376,57 @@ class Loopback(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PluginProfile(unittest.TestCase):
+    """The Hermes provider profile in plugin/claude-cli must stay call-compatible
+    with ``providers.base.ProviderProfile.fetch_models(*, api_key, timeout)``.
+    Hermes's ``provider_model_ids()`` wraps the call in a bare ``except`` that
+    also skips ``fallback_models``, so one TypeError here empties every model
+    picker (scar 2026-09-16). Hermes itself is stubbed: only the signature
+    contract is under test."""
+
+    def _load_plugin(self):
+        import importlib.util
+        import types
+
+        calls: list[dict] = []
+
+        class ProviderProfile:  # mirrors providers/base.py at Hermes v0.21.2
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+            def fetch_models(self, *, api_key=None, timeout=8.0):
+                calls.append({"api_key": api_key, "timeout": timeout})
+                return ["stub-model"]
+
+        providers = types.ModuleType("providers")
+        providers.register_provider = lambda profile: None
+        base = types.ModuleType("providers.base")
+        base.ProviderProfile = ProviderProfile
+        base.OMIT_TEMPERATURE = object()
+        providers.base = base
+        saved = {k: sys.modules.get(k) for k in ("providers", "providers.base")}
+        sys.modules["providers"], sys.modules["providers.base"] = providers, base
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "claude_cli_plugin_under_test", ROOT / "plugin" / "claude-cli" / "__init__.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        return mod, calls
+
+    def test_fetch_models_matches_base_signature_and_drops_key(self):
+        mod, calls = self._load_plugin()
+        self.assertEqual(mod.claude_cli.fetch_models(api_key="placeholder"), ["stub-model"])
+        self.assertEqual(calls, [{"api_key": None, "timeout": 8.0}])
+
+    def test_fetch_models_tolerates_extra_keywords(self):
+        mod, calls = self._load_plugin()
+        self.assertEqual(mod.claude_cli.fetch_models(api_key=None, base_url="http://x", timeout=3), ["stub-model"])
+        self.assertEqual(calls[0]["timeout"], 3)
