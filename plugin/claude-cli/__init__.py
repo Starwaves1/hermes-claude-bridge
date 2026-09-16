@@ -33,9 +33,12 @@ class ClaudeCliProfile(ProviderProfile):
                 return {}, {"reasoning_effort": effort}
         return {}, {}
 
-    def fetch_models(self, *, api_key=None, base_url=None, timeout=8.0):
+    def fetch_models(self, *, api_key=None, timeout=8.0, **_unused):
         # The bridge needs no key; never send whatever placeholder is in .env.
-        return super().fetch_models(api_key=None, base_url=base_url, timeout=timeout)
+        # ProviderProfile.fetch_models takes only api_key/timeout and reads
+        # self.base_url itself; passing base_url raised TypeError, which
+        # provider_model_ids() swallowed -> empty model list in every picker.
+        return super().fetch_models(api_key=None, timeout=timeout)
 
 
 claude_cli = ClaudeCliProfile(
