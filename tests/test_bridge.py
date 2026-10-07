@@ -1,8 +1,9 @@
-"""Unit + loopback tests for claude_bridge.py. Run: python3 -m unittest tests/test_bridge.py
+"""Stateless (text) path, rendering, errors and the provider profile.
+Run: python3 -m unittest discover -s tests
 
 The HTTP tests point the bridge at a fake `claude` script that replays a
 canned stream-json event stream, so nothing touches the real binary or the
-subscription.
+subscription. The Claude Code harness path is covered in test_v2.py.
 """
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ os.environ["CLAUDE_BRIDGE_CLAUDE_BIN"] = str(FAKE)
 os.environ["CLAUDE_BRIDGE_STATE_DIR"] = str(TMP / "state")
 os.environ["CLAUDE_BRIDGE_WORKDIR"] = str(TMP / "work")
 os.environ["CLAUDE_BRIDGE_LOG"] = str(TMP / "bridge.log")
+os.environ["CLAUDE_BRIDGE_AUTOSTART"] = "0"
 sys.path.insert(0, str(ROOT))
 import claude_bridge as cb  # noqa: E402
 
@@ -131,25 +133,22 @@ class Rendering(unittest.TestCase):
                 {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{\"a\":1}"}}]},
                 {"role": "tool", "tool_call_id": "c1", "name": "t", "content": "42"},
             ],
-            "tools": [{"type": "function", "function": {"name": "t", "description": "does t", "parameters": {"type": "object", "properties": {"a": {"type": "integer"}}}}}],
         }
         system, prompt, mode, schema = cb.build_prompts(body)
-        self.assertEqual(mode, "tools")
-        self.assertIs(schema, cb.OUTPUT_SCHEMA)
-        self.assertTrue(system.startswith("SYS A"))
-        self.assertIn("### t", system)
-        self.assertIn("StructuredOutput", system)  # the protocol names the one native tool
+        self.assertEqual(mode, "text")
+        self.assertIsNone(schema)
+        self.assertEqual(system, "SYS A")
         self.assertIn("image attachment omitted", prompt)
         self.assertIn('<tool_result id="c1" name="t">', prompt)
         self.assertIn('"arguments": {"a": 1}', prompt)
         self.assertTrue(prompt.startswith(cb.TRANSCRIPT_PREAMBLE))
-        self.assertEqual(cb.tool_name_set(body["tools"]), {"t"})
 
-    def test_no_tools_when_tool_choice_none(self):
-        body = {"messages": [{"role": "user", "content": "x"}], "tools": [{"function": {"name": "t"}}], "tool_choice": "none"}
-        system, _, mode, _ = cb.build_prompts(body)
-        self.assertEqual(mode, "text")
-        self.assertNotIn("Tool calling protocol", system)
+    def test_harness_only_with_tools(self):
+        tools = [{"function": {"name": "t"}}]
+        self.assertTrue(cb.wants_harness({"tools": tools}))
+        self.assertFalse(cb.wants_harness({"tools": tools, "tool_choice": "none"}))
+        self.assertFalse(cb.wants_harness({"messages": []}))
+        self.assertEqual(cb.tool_name_set(tools), {"t"})
 
     def test_effort_and_model(self):
         self.assertEqual(cb.normalize_effort({"reasoning_effort": "xhigh"}), "xhigh")
@@ -164,6 +163,8 @@ class Rendering(unittest.TestCase):
         self.assertEqual(cb.classify_error("Claude usage limit reached. Your limit will reset at 3pm").status, 429)
         self.assertEqual(cb.classify_error("You've hit your limit · resets 5pm").status, 429)
         self.assertEqual(cb.classify_error("some other failure").status, 502)
+        self.assertEqual(cb.classify_error("No conversation found with session ID: abc").code, "claude_session_missing")
+        self.assertIn("/login", cb.classify_error("Not logged in").message)
         limit = cb.classify_error("Claude usage limit reached. Your limit will reset at 3pm").message.lower()
         for banned in ("credit", "quota", "billing", "funds", "payment", "afford"):
             self.assertNotIn(banned, limit)
@@ -212,8 +213,6 @@ class Loopback(unittest.TestCase):
         assert lines[-1] == "data: [DONE]", lines[-1]
         return [json.loads(l[6:]) for l in lines[:-1]]
 
-    TOOLS = [{"type": "function", "function": {"name": "terminal", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}]
-
     def test_models(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/v1/models") as r:
             ids = [m["id"] for m in json.load(r)["data"]]
@@ -236,75 +235,6 @@ class Loopback(unittest.TestCase):
         self.assertEqual(argv[argv.index("--model") + 1], "fable")
         self.assertEqual(argv[argv.index("--effort") + 1], "medium")
         self.assertIn("<user>\nhi\n</user>", STDIN.read_text())
-
-    def test_tool_call_roundtrip(self):
-        canned('{"content":"checking","tool_calls":[{"name":"terminal","arguments":{"command":"date"}}]}', structured={"content": "checking", "tool_calls": [{"name": "terminal", "arguments": {"command": "date"}}]})
-        body = {"model": "sonnet", "messages": [{"role": "user", "content": "what time is it"}], "tools": self.TOOLS}
-        status, out = self.post(body)
-        self.assertEqual(status, 200)
-        msg = out["choices"][0]["message"]
-        self.assertEqual(out["choices"][0]["finish_reason"], "tool_calls")
-        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "terminal")
-        self.assertEqual(json.loads(msg["tool_calls"][0]["function"]["arguments"]), {"command": "date"})
-        self.assertTrue(msg["tool_calls"][0]["id"].startswith("call_"))
-        argv = ARGS.read_text().splitlines()
-        self.assertIn("--json-schema", argv)
-
-    def test_native_tool_call_is_intercepted(self):
-        # What Opus 4.8 did on 2026-09-03: call the Hermes tool natively. Claude
-        # Code would answer "No such tool available" and the model would then
-        # tell the user its tools are gone. The bridge must take the first
-        # message's tool_use and ignore everything after it.
-        write_events([
-            ev_init("claude-opus-4-8"), ev_rate(), ev_start(),
-            ev_text_delta("one sec"),
-            ev_assistant([{"type": "text", "text": "one sec"}]),
-            ev_assistant([{"type": "tool_use", "id": "toolu_a", "name": "terminal", "input": {"command": "date"}}]),
-            ev_message_delta(), ev_stop(),
-            ev_user_tool_result("No such tool available: terminal"),
-            ev_start(),
-            ev_assistant([{"type": "tool_use", "id": "toolu_b", "name": "StructuredOutput", "input": {"content": "my tools are gone", "tool_calls": []}}]),
-            ev_message_delta({"input_tokens": 500, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 9}), ev_stop(),
-            ev_result('{"content":"my tools are gone","tool_calls":[]}', {"content": "my tools are gone", "tool_calls": []}, num_turns=2, model="claude-opus-4-8"),
-        ])
-        body = {"model": "claude-opus-4-8", "messages": [{"role": "user", "content": "what time is it"}], "tools": self.TOOLS}
-        status, out = self.post(body)
-        self.assertEqual(status, 200)
-        msg = out["choices"][0]["message"]
-        self.assertEqual(out["choices"][0]["finish_reason"], "tool_calls")
-        self.assertEqual(msg["content"], "one sec")
-        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "terminal")
-        self.assertEqual(json.loads(msg["tool_calls"][0]["function"]["arguments"]), {"command": "date"})
-        self.assertEqual(out["usage"]["prompt_tokens"], 15)  # first call's usage, the second turn never counted
-        self.assertNotIn("gone", json.dumps(out))
-
-    def test_unknown_native_name_is_not_intercepted(self):
-        write_events([
-            ev_init(), ev_start(),
-            ev_assistant([{"type": "tool_use", "id": "toolu_a", "name": "bogus_tool", "input": {}}]),
-            ev_message_delta(), ev_stop(),
-            ev_user_tool_result("No such tool available: bogus_tool"),
-            ev_start(),
-            ev_assistant([{"type": "tool_use", "id": "toolu_b", "name": "StructuredOutput", "input": {"content": "fine", "tool_calls": []}}]),
-            ev_message_delta(), ev_stop(),
-            ev_result('{"content":"fine","tool_calls":[]}', {"content": "fine", "tool_calls": []}, num_turns=2),
-        ])
-        body = {"model": "fable", "messages": [{"role": "user", "content": "x"}], "tools": self.TOOLS}
-        status, out = self.post(body)
-        self.assertEqual(status, 200)
-        self.assertEqual(out["choices"][0]["message"]["content"], "fine")
-        self.assertEqual(out["choices"][0]["finish_reason"], "stop")
-
-    def test_streaming_tools_mode(self):
-        canned("streamed answer", structured={"content": "streamed answer", "tool_calls": []})
-        body = {"model": "fable", "stream": True, "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": "x"}], "tools": [{"function": {"name": "t", "parameters": {}}}]}
-        status, raw = self.post(body, raw=True)
-        self.assertEqual(status, 200)
-        events = self.sse_events(raw)
-        text = "".join(e["choices"][0]["delta"].get("content") or "" for e in events if e["choices"])
-        self.assertEqual(text, "streamed answer")
-        self.assertEqual([e for e in events if e["choices"]][-1]["choices"][0]["finish_reason"], "stop")
-        self.assertEqual(events[-1]["usage"]["completion_tokens"], 7)
 
     def test_streaming_text_mode_forwards_deltas_once(self):
         canned("streamed answer", deltas=["stre", "amed ", "answer"])
@@ -340,7 +270,7 @@ class Loopback(unittest.TestCase):
         canned("Not logged in · Please run /login", is_error=True)
         status, out = self.post({"model": "fable", "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(status, 401)
-        self.assertIn("claude auth login", out["error"]["message"])
+        self.assertIn("/login", out["error"]["message"])
         canned("Claude usage limit reached. Your limit will reset at 3pm", is_error=True)
         status, out = self.post({"model": "fable", "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(status, 429)
@@ -373,9 +303,6 @@ class Loopback(unittest.TestCase):
         status, out = self.post({"model": "gpt-5", "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(status, 404)
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PluginProfile(unittest.TestCase):
@@ -430,3 +357,47 @@ class PluginProfile(unittest.TestCase):
         mod, calls = self._load_plugin()
         self.assertEqual(mod.claude_cli.fetch_models(api_key=None, base_url="http://x", timeout=3), ["stub-model"])
         self.assertEqual(calls[0]["timeout"], 3)
+
+    def test_conversation_key_and_effort(self):
+        mod, _ = self._load_plugin()
+        p = mod.claude_cli
+        self.assertEqual(p.build_extra_body(session_id="s1", model="fable"), {"claude_bridge_session": "s1"})
+        self.assertEqual(p.build_extra_body(model="fable"), {})  # auxiliary calls carry no session
+        extra, top = p.build_api_kwargs_extras(reasoning_config={"enabled": True, "effort": "xhigh"}, session_id="s1", cache_scope_id="root")
+        self.assertEqual(extra, {"claude_bridge_session": "root"})  # compression-stable scope wins
+        self.assertEqual(top, {"reasoning_effort": "xhigh"})
+        self.assertEqual(p.build_api_kwargs_extras(reasoning_config=None), ({}, {}))
+
+    def test_supervisor_starts_bridge_when_port_is_dead(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        over = {"CLAUDE_CLI_BRIDGE_BASE_URL": f"http://127.0.0.1:{port}/v1", "CLAUDE_BRIDGE_AUTOSTART": "1", "CLAUDE_BRIDGE_STATE_DIR": str(TMP / "sup")}
+        saved = {k: os.environ.get(k) for k in over}
+        os.environ.update(over)
+        try:
+            mod, _ = self._load_plugin()  # import itself runs ensure(force=True)
+            sup = mod.SUPERVISOR
+            self.assertIsNotNone(sup.proc)
+            self.assertTrue(sup.up())
+            first = sup.proc
+            sup.ensure(force=True)
+            self.assertIs(sup.proc, first)  # healthy: no second spawn
+            self.assertIn("listening", (TMP / "sup" / "bridge.log").read_text())
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            try:
+                mod.SUPERVISOR.proc.terminate()
+                mod.SUPERVISOR.proc.wait(5)
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    unittest.main()

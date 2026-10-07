@@ -1,0 +1,6 @@
+name: claude-login
+version: 2.0.0
+description: "/login for the claude-cli bridge: runs claude auth login in a pty and relays it to the chat; the code never reaches the agent"
+author: Starwaves1
+hooks:
+  - pre_gateway_dispatch

@@ -1,37 +1,29 @@
 #!/usr/bin/env python3
-"""claude_bridge.py — Hermes → `claude -p` loopback bridge.
+"""claude_bridge.py — Hermes front end, Claude Code harness.
 
-An OpenAI-compatible HTTP server (chat completions + models) that answers
-every request by spawning the local, unmodified `claude` binary in print
-mode. The binary owns its own claude.ai login, so usage draws from the
-subscription and this process never sees, stores, or forwards a token.
+An OpenAI-compatible loopback server (chat completions + models). Requests
+that carry Hermes tools run as turns of a persistent Claude Code session
+(`claude -p --resume`, auto permission mode, all of Claude Code's own tools,
+MCP servers, skills and CLAUDE.md). Hermes tools that Claude Code lacks are
+requested through a JSON reply contract (--json-schema); Hermes runs them
+and the results come back as the next turn. Requests without tools (titles,
+summaries) stay stateless with every customisation off (--safe-mode).
 
-Design (settled 2026-09-03, see README):
-- Hermes owns the agent loop. Claude Code's tools are disabled on every
-  spawn (--tools "" --safe-mode --strict-mcp-config).
-- Hermes tool schemas are rendered into the system prompt; the model
-  answers in a fixed JSON shape (--json-schema) that this bridge converts
-  into OpenAI tool_calls. No tool ever runs inside the child process.
-- The child is read as an event stream (--output-format stream-json). If the
-  model calls a Hermes tool *natively* instead of via the JSON reply (Opus
-  4.8 does this), the bridge intercepts that tool_use block, stops the child
-  and returns it as a normal tool call — Claude Code would otherwise answer
-  "No such tool available" and the model would tell the user its tools are
-  gone (observed 2026-09-03, see ai/README.md).
-- Usage-limit and login errors come back as HTTP errors with a plain
-  message. There is deliberately no fallback model here.
-
+The binary owns its own claude.ai login; this process never sees a token.
 Stdlib only. Python 3.9+.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import pwd
 import queue
 import re
+import select
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,31 +34,54 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
+
+
+def _user() -> str:
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:  # containers often run a uid with no passwd entry
+        return os.environ.get("USER") or "hermes"
+
+
+def _env_list(name: str, default: Iterable[str] = ()) -> Set[str]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return set(default)
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
 
 HOME = Path(os.path.expanduser("~"))
-USER = pwd.getpwuid(os.getuid()).pw_name
-STATE_DIR = Path(os.environ.get("CLAUDE_BRIDGE_STATE_DIR", str(HOME / ".hermes" / "claude-bridge")))
+USER = _user()
+_DEFAULT_STATE = HOME / ".hermes" / "claude-bridge" if (HOME / ".hermes").is_dir() else HOME / "claude-bridge"
+STATE_DIR = Path(os.environ.get("CLAUDE_BRIDGE_STATE_DIR", str(_DEFAULT_STATE)))
 CLAUDE_BIN = os.environ.get("CLAUDE_BRIDGE_CLAUDE_BIN", str(HOME / ".local" / "bin" / "claude"))
-WORKDIR = Path(os.environ.get("CLAUDE_BRIDGE_WORKDIR", str(STATE_DIR / "workdir")))
+WORKDIR = Path(os.environ.get("CLAUDE_BRIDGE_WORKDIR", str(HOME / "workspace")))
+SCRATCH_DIR = STATE_DIR / "workdir"
+SESSIONS_FILE = STATE_DIR / "sessions.json"
 LOG_FILE = Path(os.environ.get("CLAUDE_BRIDGE_LOG", str(STATE_DIR / "bridge.log")))
-DUMP_DIR = os.environ.get("CLAUDE_BRIDGE_DUMP_DIR", "")  # debugging only: writes conversation content, one file set per request id
-MAX_CONCURRENCY = int(os.environ.get("CLAUDE_BRIDGE_MAX_CONCURRENCY", "3"))
-SPAWN_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_TIMEOUT", "900"))
+DUMP_DIR = os.environ.get("CLAUDE_BRIDGE_DUMP_DIR", "")  # debugging only: writes conversation content
+MAX_CONCURRENCY = int(os.environ.get("CLAUDE_BRIDGE_MAX_CONCURRENCY", "2"))
+SPAWN_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_TIMEOUT", "1800"))
 QUEUE_WAIT = float(os.environ.get("CLAUDE_BRIDGE_QUEUE_WAIT", "120"))
-CONTEXT_LENGTH = int(os.environ.get("CLAUDE_BRIDGE_CONTEXT_LENGTH", "200000"))
-# Streamed requests outside the tool loop get an empty keep-alive chunk after
-# this many silent seconds (Hermes counts any chunk as compression progress;
-# its default idle budget is 30s). The tool loop never heartbeats, so its
-# errors keep arriving as real HTTP status codes.
+CONTEXT_LENGTH = int(os.environ.get("CLAUDE_BRIDGE_CONTEXT_LENGTH", "1000000"))
 HEARTBEAT_SECONDS = float(os.environ.get("CLAUDE_BRIDGE_HEARTBEAT", "10"))
+PERMISSION_MODE = os.environ.get("CLAUDE_BRIDGE_PERMISSION_MODE", "auto")
+SESSION_TTL = float(os.environ.get("CLAUDE_BRIDGE_SESSION_TTL_DAYS", "30")) * 86400
+ADOPT_WINDOW = 12 * 3600
 FAKE_ERROR = os.environ.get("CLAUDE_BRIDGE_FAKE_ERROR", "")  # test hook: "limit" | "login" | "crash"
 
-# The one native tool Claude Code registers when --json-schema is given.
-STRUCTURED_TOOL = "StructuredOutput"
+# Hermes tools Claude Code already has natively; they are not offered twice.
+DEFAULT_DROP_TOOLS = (
+    "terminal", "process_manage", "read_file", "write_file", "patch", "search_files",
+    "web_search", "web_extract", "vision_analyze", "execute_code", "delegate_task",
+    "todo_list", "manage_connections",
+)
+DROP_TOOLS = _env_list("CLAUDE_BRIDGE_DROP_TOOLS", DEFAULT_DROP_TOOLS) - _env_list("CLAUDE_BRIDGE_KEEP_TOOLS")
 
-# Model names Hermes may ask for. Aliases are passed to `claude --model`
-# verbatim (the binary resolves them, honouring ~/.claude/settings.json pins).
+STRUCTURED_TOOL = "StructuredOutput"
+SESSION_FIELD = "claude_bridge_session"
+
 MODEL_ALIASES = ("fable", "opus", "sonnet", "haiku")
 MODEL_IDS = (
     "claude-fable-5-1",
@@ -77,7 +92,6 @@ MODEL_IDS = (
 )
 _MODEL_RE = re.compile(r"^claude-[a-z0-9.-]+(\[1m\])?$")
 
-# Hermes effort vocabulary → Claude Code --effort vocabulary.
 EFFORT_MAP = {
     "none": "low",
     "minimal": "low",
@@ -109,28 +123,31 @@ OUTPUT_SCHEMA = {
     "required": ["content", "tool_calls"],
 }
 
-TOOL_PROTOCOL_HEADER = """
+HARNESS_HEADER = """
 
-# Tool calling protocol
+# Running behind Hermes
 
-The tools listed below belong to the Hermes harness. Hermes runs them and
-returns the results as <tool_result> blocks in the next turn of the
-transcript. They are NOT tools of your own runtime: your runtime exposes
-exactly one native tool, StructuredOutput, which you use to deliver your
-reply. Never invoke the names below through native function calling — that
-fails with "No such tool available". Request them only inside the JSON reply.
+You are Claude Code, and the user reaches you through Hermes, a chat gateway
+(Discord, Telegram, CLI, ...) that also keeps memory, schedules and voice.
+Two kinds of tools exist in this conversation:
 
-Deliver every reply by calling StructuredOutput once with a JSON object of
-exactly two fields (do not write the JSON as plain text):
-- "content": your message to the user. It may be empty while you are still
-  working with tools.
-- "tool_calls": a list of {"name": <tool name>, "arguments": <object matching
-  the tool's parameters>}. Use [] when no tool is needed.
+1. Your own Claude Code tools: Bash, Read, Edit, Write, Glob, Grep, WebSearch,
+   WebFetch, Agent, TodoWrite, your MCP servers and connectors, skills. They
+   are native. Use them directly and freely, as often as the task needs,
+   before you answer.
+2. Hermes tools, listed below. They are NOT native: calling one natively
+   fails with "No such tool available". Request them in your final reply;
+   Hermes runs them and sends the results back as your next message, inside
+   <tool_result> blocks.
 
-Call several independent tools in one reply when that saves a round trip.
-Never invent tool names or argument fields that are not in the schema.
+<<DROPPED>>Finish every turn by calling StructuredOutput exactly once (do not write the
+reply as plain text first) with:
+- "content": your message to the user; Hermes delivers it. It may be empty
+  while you wait for Hermes tool results.
+- "tool_calls": a list of {"name": <Hermes tool>, "arguments": <object
+  matching its parameters>}. Use [] when no Hermes tool is needed.
 
-## Available tools
+## Hermes tools
 """
 
 TRANSCRIPT_PREAMBLE = """Below is the conversation so far, as a transcript. You are the assistant.
@@ -140,6 +157,17 @@ turn, addressed to the user, with no tags and no transcript formatting.
 
 """
 
+BOOTSTRAP_PREAMBLE = """This conversation started in Hermes before this Claude Code session existed.
+Its history so far, as a transcript (your earlier turns are <assistant>; tool
+calls you see there were Hermes tools):
+
+"""
+
+RESEND_NUDGE = "(Hermes sent this turn again: your previous reply never reached the user. Give your final reply again.)"
+
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_DATA_URL = re.compile(r"^data:([a-zA-Z0-9.+/-]+);base64,(.*)$", re.S)
+
 log = logging.getLogger("claude_bridge")
 _slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
@@ -148,12 +176,10 @@ _slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
 
 def child_env() -> Dict[str, str]:
-    """Environment for the `claude` child: minimal and deliberately clean.
+    """Minimal, clean environment for every `claude` child.
 
-    `USER` is what unlocks the keychain login (verified 2026-09-03: HOME+PATH
-    alone reports "Not logged in"). No ANTHROPIC_* or CLAUDE_* variables are
-    ever passed through, so an API key in the parent can never bill instead
-    of the subscription and a parent Claude Code session cannot nest.
+    USER unlocks the macOS keychain login. Nothing ANTHROPIC_* or CLAUDE*
+    passes through, so an API key cannot bill and a parent session cannot nest.
     """
     return {
         "HOME": str(HOME),
@@ -165,6 +191,19 @@ def child_env() -> Dict[str, str]:
         "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
         "DISABLE_AUTOUPDATER": "1",
     }
+
+
+_HELP: Dict[str, str] = {}
+
+
+def claude_supports(flag: str) -> bool:
+    if "text" not in _HELP:
+        try:
+            out = subprocess.run([CLAUDE_BIN, "--help"], capture_output=True, text=True, timeout=30, env=child_env())
+            _HELP["text"] = out.stdout + out.stderr
+        except Exception:
+            _HELP["text"] = ""
+    return flag in _HELP["text"]
 
 
 def normalize_model(name: Optional[str]) -> Optional[str]:
@@ -184,11 +223,6 @@ def normalize_effort(body: Dict[str, Any]) -> str:
 
 
 def effort_with_source(body: Dict[str, Any]) -> Tuple[str, str]:
-    """Return (claude_effort, source) where source is "request" or "default".
-
-    Logged on every call so a missing `/effort` plumbing shows up as
-    effort=medium(default) instead of hiding behind the default value.
-    """
     raw = body.get("reasoning_effort")
     if raw is None:
         reasoning = body.get("reasoning")
@@ -219,7 +253,7 @@ def content_to_text(content: Any) -> str:
             if t == "text":
                 parts.append(str(p.get("text", "")))
             elif t in ("image_url", "image", "input_image"):
-                parts.append("[image attachment omitted: this model route is text-only]")
+                parts.append("[image attachment omitted]")
             elif t in ("input_audio", "audio"):
                 parts.append("[audio attachment omitted]")
             else:
@@ -242,13 +276,21 @@ def split_system(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, An
     return "\n\n".join(system_parts), rest
 
 
+def tool_name(t: Any) -> str:
+    fn = t.get("function", t) if isinstance(t, dict) else {}
+    return str(fn.get("name") or "") if isinstance(fn, dict) else ""
+
+
 def tool_name_set(tools: Iterable[Dict[str, Any]]) -> Set[str]:
-    names: Set[str] = set()
-    for t in tools or ():
-        fn = t.get("function", t) if isinstance(t, dict) else {}
-        if isinstance(fn, dict) and fn.get("name"):
-            names.add(str(fn["name"]))
-    return names
+    return {n for n in (tool_name(t) for t in tools or ()) if n}
+
+
+def hermes_tools(tools: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Split Hermes tools into (offered, dropped-because-Claude-Code-has-it)."""
+    kept, dropped = [], []
+    for t in tools or []:
+        (dropped if tool_name(t) in DROP_TOOLS else kept).append(t)
+    return kept, [tool_name(t) for t in dropped]
 
 
 def render_tools(tools: List[Dict[str, Any]]) -> str:
@@ -265,6 +307,17 @@ def render_tools(tools: List[Dict[str, Any]]) -> str:
     return "\n\n".join(out)
 
 
+def _call_args(c: Dict[str, Any]) -> Any:
+    fn = c.get("function", {}) if isinstance(c, dict) else {}
+    args = fn.get("arguments", "")
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except Exception:
+            return args
+    return args
+
+
 def render_transcript(messages: List[Dict[str, Any]]) -> str:
     blocks: List[str] = []
     for m in messages:
@@ -276,21 +329,10 @@ def render_transcript(messages: List[Dict[str, Any]]) -> str:
             calls = m.get("tool_calls") or []
             inner = text
             if calls:
-                rendered = []
-                for c in calls:
-                    fn = c.get("function", {}) if isinstance(c, dict) else {}
-                    args = fn.get("arguments", "")
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            pass
-                    rendered.append(
-                        json.dumps(
-                            {"id": c.get("id"), "name": fn.get("name"), "arguments": args},
-                            ensure_ascii=False,
-                        )
-                    )
+                rendered = [
+                    json.dumps({"id": c.get("id"), "name": (c.get("function") or {}).get("name"), "arguments": _call_args(c)}, ensure_ascii=False)
+                    for c in calls if isinstance(c, dict)
+                ]
                 inner = (text + "\n" if text else "") + "<tool_calls>\n" + "\n".join(rendered) + "\n</tool_calls>"
             blocks.append(f"<assistant>\n{inner}\n</assistant>")
         elif role == "tool":
@@ -304,39 +346,212 @@ def render_transcript(messages: List[Dict[str, Any]]) -> str:
 
 
 def build_prompts(body: Dict[str, Any]) -> Tuple[str, str, str, Optional[Dict[str, Any]]]:
-    """Return (system_prompt, user_prompt, mode, schema).
-
-    mode is "tools" (Hermes tool loop → fixed JSON contract), "json" (caller
-    sent response_format=json_schema → that schema), "json_object"
-    (response_format=json_object → instruction only) or "text".
-    """
+    """Stateless path. Return (system_prompt, user_prompt, mode, schema);
+    mode is "json" (response_format json_schema), "json_object" or "text"."""
     messages = body.get("messages") or []
     system_text, rest = split_system(messages)
-    tools = body.get("tools") or []
-    tool_choice = body.get("tool_choice", "auto")
-    tools_enabled = bool(tools) and tool_choice != "none"
     mode: str = "text"
     schema: Optional[Dict[str, Any]] = None
-    if tools_enabled:
-        mode, schema = "tools", OUTPUT_SCHEMA
-        system_text = (system_text or "You are a helpful assistant.") + TOOL_PROTOCOL_HEADER + render_tools(tools)
-        if tool_choice in ("required", "any") or isinstance(tool_choice, dict):
-            system_text += "\n\nFor this turn you must call at least one tool."
-    else:
-        rf = body.get("response_format")
-        if isinstance(rf, dict):
-            if rf.get("type") == "json_schema":
-                js = rf.get("json_schema")
-                cand = js.get("schema") if isinstance(js, dict) else None
-                if isinstance(cand, dict):
-                    mode, schema = "json", cand
-            elif rf.get("type") == "json_object":
-                mode = "json_object"
-                system_text = (system_text or "You are a helpful assistant.") + "\n\nRespond with a single JSON object and nothing else."
+    rf = body.get("response_format")
+    if isinstance(rf, dict):
+        if rf.get("type") == "json_schema":
+            js = rf.get("json_schema")
+            cand = js.get("schema") if isinstance(js, dict) else None
+            if isinstance(cand, dict):
+                mode, schema = "json", cand
+        elif rf.get("type") == "json_object":
+            mode = "json_object"
+            system_text = (system_text or "You are a helpful assistant.") + "\n\nRespond with a single JSON object and nothing else."
     if not system_text:
         system_text = "You are a helpful assistant."
-    user_prompt = TRANSCRIPT_PREAMBLE + render_transcript(rest)
-    return system_text, user_prompt, mode, schema
+    return system_text, TRANSCRIPT_PREAMBLE + render_transcript(rest), mode, schema
+
+
+def wants_harness(body: Dict[str, Any]) -> bool:
+    return bool(body.get("tools")) and body.get("tool_choice", "auto") != "none"
+
+
+# ── session map ─────────────────────────────────────────────────────
+
+
+def msg_hash(m: Dict[str, Any]) -> str:
+    """Content identity of one OpenAI message, stable across Hermes's
+    re-serialisation (tool-call ids and JSON spacing ignored)."""
+    calls = [[(c.get("function") or {}).get("name"), _call_args(c)] for c in (m.get("tool_calls") or []) if isinstance(c, dict)]
+    payload = [m.get("role"), content_to_text(m.get("content")).strip(), calls, m.get("tool_call_id") or ""]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:32]
+
+
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def session_key(body: Dict[str, Any], system_text: str, rest: List[Dict[str, Any]]) -> str:
+    for src in (body, body.get("metadata"), body.get("extra_body")):
+        if isinstance(src, dict) and src.get(SESSION_FIELD):
+            return str(src[SESSION_FIELD])
+    first = next((content_to_text(m.get("content")) for m in rest if m.get("role") == "user"), "")
+    return "anon:" + text_hash(system_text + "\x00" + first)
+
+
+def resume_point(rest: List[Dict[str, Any]], entry: Dict[str, Any]) -> Optional[int]:
+    """Index of the first message the Claude Code session has not seen, or None."""
+    hashes = [msg_hash(m) for m in rest]
+    for want, skip_assistant in ((entry.get("last"), False), (entry.get("fed"), True)):
+        if not want:
+            continue
+        for i in range(len(hashes) - 1, -1, -1):
+            if hashes[i] == want:
+                j = i + 1
+                while skip_assistant and j < len(rest) and rest[j].get("role") == "assistant":
+                    j += 1
+                return j
+    return None
+
+
+def adopt(rest: List[Dict[str, Any]], key: str, store: "SessionStore") -> Optional[Tuple[str, Dict[str, Any], int]]:
+    """A recent session under another key whose last reply is in this history.
+
+    Hermes v0.20.4 gives the profile only the physical session id, which
+    rotates on context compression; this keeps the Claude Code session.
+    Short replies without tool calls ("Done.") are too common to trust.
+    """
+    by_hash = {msg_hash(m): (i, m) for i, m in enumerate(rest)}
+    best: Optional[Tuple[str, Dict[str, Any], int]] = None
+    for k, e in store.items():
+        if k == key or time.time() - float(e.get("updated") or 0) > ADOPT_WINDOW:
+            continue
+        hit = by_hash.get(e.get("last") or "")
+        if not hit:
+            continue
+        i, m = hit
+        if not m.get("tool_calls") and len(content_to_text(m.get("content")).strip()) < 24:
+            continue
+        if best is None or float(e["updated"]) > float(best[1]["updated"]):
+            best = (k, e, i + 1)
+    return best
+
+
+class SessionStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._data: Optional[Dict[str, Dict[str, Any]]] = None
+        self._turn_locks: Dict[str, threading.Lock] = {}
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        if self._data is None:
+            try:
+                self._data = json.loads(self.path.read_text())
+            except Exception:
+                self._data = {}
+        return self._data
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            e = self._load().get(key)
+            return dict(e) if e else None
+
+    def put(self, key: str, entry: Dict[str, Any]) -> None:
+        with self._lock:
+            data = self._load()
+            now = time.time()
+            entry["updated"] = now
+            data[key] = entry
+            for k in [k for k, v in data.items() if now - float(v.get("updated") or 0) > SESSION_TTL]:
+                del data[k]
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1))
+            os.replace(tmp, self.path)
+
+    def items(self) -> List[Tuple[str, Dict[str, Any]]]:
+        with self._lock:
+            return [(k, dict(v)) for k, v in self._load().items()]
+
+    def drop(self, key: str) -> None:
+        with self._lock:
+            self._load().pop(key, None)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._load())
+
+    def turn_lock(self, key: str) -> threading.Lock:
+        with self._lock:
+            return self._turn_locks.setdefault(key, threading.Lock())
+
+
+STORE = SessionStore(SESSIONS_FILE)
+
+
+# ── turn content (stream-json input) ────────────────────────────────
+
+
+def image_block(part: Dict[str, Any]) -> Dict[str, Any]:
+    if part.get("type") == "image" and isinstance(part.get("source"), dict):
+        return part
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    url = str(url or part.get("url") or "")
+    m = _DATA_URL.match(url)
+    if m and m.group(1).lower() in _IMAGE_TYPES:
+        return {"type": "image", "source": {"type": "base64", "media_type": m.group(1).lower(), "data": m.group(2).strip()}}
+    if m:
+        return {"type": "text", "text": f"[attachment of type {m.group(1)} not passed through: only png, jpeg, gif and webp images are supported]"}
+    return {"type": "text", "text": f"[remote image not attached: {url[:300]} — only inline data: images reach you; fetch it yourself if you need it]"}
+
+
+def content_blocks(content: Any) -> List[Dict[str, Any]]:
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if isinstance(content, dict):
+        content = [content]
+    out: List[Dict[str, Any]] = []
+    for p in content:
+        if isinstance(p, dict) and p.get("type") in ("image_url", "image", "input_image"):
+            out.append(image_block(p))
+        elif isinstance(p, dict) and p.get("type") == "text":
+            if p.get("text"):
+                out.append({"type": "text", "text": str(p["text"])})
+        else:
+            t = content_to_text([p])
+            if t:
+                out.append({"type": "text", "text": t})
+    return out
+
+
+def turn_blocks(delta: List[Dict[str, Any]], history: List[Dict[str, Any]], names: Dict[str, str]) -> List[Dict[str, Any]]:
+    """One user turn for the Claude Code session: optional bootstrap history,
+    then Hermes tool results and new user input, images as image blocks."""
+    blocks: List[Dict[str, Any]] = []
+    if history:
+        blocks.append({"type": "text", "text": BOOTSTRAP_PREAMBLE + render_transcript(history) + "\n\nThe newest input follows."})
+    if any(m.get("role") == "tool" for m in delta):
+        blocks.append({"type": "text", "text": "Results of the Hermes tool calls you requested:"})
+    for m in delta:
+        role = m.get("role")
+        if role == "tool":
+            cid = str(m.get("tool_call_id") or "")
+            name = str(m.get("name") or names.get(cid, ""))
+            inner = content_blocks(m.get("content"))
+            text = "\n".join(b["text"] for b in inner if b["type"] == "text")
+            blocks.append({"type": "text", "text": f"<tool_result tool_call_id=\"{cid}\" name=\"{name}\">\n{text}\n</tool_result>"})
+            blocks.extend(b for b in inner if b["type"] == "image")
+        elif role == "user":
+            blocks.extend(content_blocks(m.get("content")))
+        else:
+            blocks.append({"type": "text", "text": "(Turn recorded by Hermes outside this session)\n" + render_transcript([m])})
+    if not blocks:
+        blocks.append({"type": "text", "text": RESEND_NUDGE})
+    return blocks
+
+
+def stream_json_line(blocks: List[Dict[str, Any]]) -> str:
+    return json.dumps({"type": "user", "message": {"role": "user", "content": blocks}}, ensure_ascii=False) + "\n"
 
 
 # ── claude subprocess ───────────────────────────────────────────────
@@ -351,8 +566,13 @@ class BridgeError(Exception):
         self.etype = etype
 
 
+class ClientGone(Exception):
+    pass
+
+
 _LIMIT_RE = re.compile(r"limit", re.I)
 _LIMIT_HINT_RE = re.compile(r"usage|reset|hit your|reached|exceed|out of", re.I)
+_NO_SESSION_RE = re.compile(r"no conversation found|session .*not found", re.I)
 
 
 def classify_error(text: str) -> BridgeError:
@@ -360,14 +580,13 @@ def classify_error(text: str) -> BridgeError:
 
     The usage-limit message must avoid the words Hermes's auxiliary router
     treats as billing exhaustion (credits, quota, billing, funds, payment,
-    afford): those make it silently retry on the next provider in its
-    chain, which this bridge rules out on purpose. See tests/test_bridge.py.
+    afford): those make it silently retry on the next provider.
     """
     t = (text or "").strip() or "claude returned an error with no message"
     if "not logged in" in t.lower() or "/login" in t.lower():
         return BridgeError(
             401,
-            "Claude Code is not logged in on this Mac. Run `claude auth login` in a terminal, then retry.",
+            "Claude Code is not logged in — run /login in chat (or `claude auth login` in a terminal), then retry.",
             code="claude_not_logged_in",
             etype="authentication_error",
         )
@@ -378,6 +597,8 @@ def classify_error(text: str) -> BridgeError:
             code="claude_usage_limit",
             etype="rate_limit_error",
         )
+    if _NO_SESSION_RE.search(t):
+        return BridgeError(409, f"claude session missing: {t}", code="claude_session_missing", etype="upstream_error")
     return BridgeError(502, f"claude -p failed: {t}", code="claude_error", etype="upstream_error")
 
 
@@ -385,23 +606,25 @@ class ClaudeRun:
     """Everything one `claude -p` spawn produced, as seen on its event stream."""
 
     def __init__(self) -> None:
-        self.result_text: str = ""            # final `result` field of the result event
-        self.structured: Any = None           # `structured_output` of the result event
+        self.result_text: str = ""
+        self.structured: Any = None
         self.saw_result: bool = False
         self.is_error: bool = False
         self.subtype: str = ""
         self.num_turns: int = 0
+        self.session_id: str = ""
+        self.permission_mode: str = ""
         self.model_ids: List[str] = []
         self.api_key_source: str = ""
         self.rate_limit: Optional[Dict[str, Any]] = None   # unifiedWindows from the last rate_limit_event
         self.usage_last: Optional[Dict[str, Any]] = None   # usage of the LAST API call = real context size
-        self.usage_total: Optional[Dict[str, Any]] = None  # aggregated usage across turns (result event)
-        self.intercepted: bool = False
-        self.native_calls: List[Dict[str, Any]] = []      # tool_use blocks the bridge took over
-        self.native_text: str = ""                        # text blocks of that same message
-        self.unknown_tool_errors: int = 0                 # "No such tool available" replies seen
-        self.text_streamed: str = ""                      # text deltas already handed to on_text
-        self.final_text: str = ""                         # text blocks of the last assistant message
+        self.usage_total: Optional[Dict[str, Any]] = None  # summed over the spawn's API calls
+        self.native_tools: List[str] = []                  # tool_use names other than StructuredOutput
+        self.misrouted: List[str] = []                     # Hermes tools the model tried to call natively
+        self.unknown_tool_errors: int = 0
+        self.permission_denials: int = 0
+        self.text_streamed: str = ""
+        self.final_text: str = ""
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -417,24 +640,23 @@ def _terminate(proc: subprocess.Popen) -> None:
             pass
 
 
-def run_claude(
-    model: str,
-    effort: str,
-    system_prompt: str,
-    user_prompt: str,
-    schema: Optional[Dict[str, Any]] = None,
-    tool_names: Optional[Set[str]] = None,
-    on_text: Optional[Callable[[str], None]] = None,
-    on_tick: Optional[Callable[[], None]] = None,
-    on_event: Optional[Callable[[str], None]] = None,
-) -> ClaudeRun:
-    """Spawn `claude -p` and consume its stream-json events.
+def _close_pipes(proc: subprocess.Popen) -> None:
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except Exception:
+            pass
 
-    on_text(delta) receives text deltas as they arrive (caller decides whether
-    to forward them). on_tick() is called on every event and at least once a
-    second while waiting, so the caller can keep its own connection alive.
-    on_event(raw_line) sees every stdout line (debug dumps).
-    """
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fake_error() -> None:
     if FAKE_ERROR == "limit":
         raise classify_error("Claude usage limit reached. Your limit will reset at 3pm (America/New_York).")
     if FAKE_ERROR == "login":
@@ -442,28 +664,25 @@ def run_claude(
     if FAKE_ERROR == "crash":
         raise BridgeError(502, "claude -p failed: simulated crash", code="claude_error", etype="upstream_error")
 
-    tool_names = tool_names or set()
-    WORKDIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="sys-", dir=str(WORKDIR), delete=False) as f:
-        f.write(system_prompt)
-        sys_path = f.name
-    cmd = [
-        CLAUDE_BIN, "-p",
-        "--safe-mode",
-        "--tools", "",
-        "--strict-mcp-config",
-        "--disable-slash-commands",
-        "--no-session-persistence",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--model", model,
-        "--effort", effort,
-        "--system-prompt-file", sys_path,
-    ]
-    if schema:
-        cmd += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
 
+def spawn_claude(
+    cmd: List[str],
+    stdin_text: str,
+    cwd: Path,
+    hermes_names: Optional[Set[str]] = None,
+    on_text: Optional[Callable[[str], None]] = None,
+    on_tick: Optional[Callable[[], None]] = None,
+    on_event: Optional[Callable[[str], None]] = None,
+) -> ClaudeRun:
+    """Run one `claude -p` and consume its stream-json events.
+
+    on_text(delta) gets text deltas; on_tick() runs on every event and at
+    least once a second (it may raise ClientGone to abort the child);
+    on_event(raw_line) sees every stdout line.
+    """
+    _fake_error()
+    hermes_names = hermes_names or set()
+    cwd.mkdir(parents=True, exist_ok=True)
     run = ClaudeRun()
     try:
         proc = subprocess.Popen(
@@ -474,11 +693,10 @@ def run_claude(
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=str(WORKDIR),
+            cwd=str(cwd),
             env=child_env(),
         )
     except FileNotFoundError:
-        _unlink(sys_path)
         raise BridgeError(500, f"claude binary not found at {CLAUDE_BIN}", code="claude_missing")
 
     lines: "queue.Queue[Optional[str]]" = queue.Queue()
@@ -488,7 +706,7 @@ def run_claude(
     def feed() -> None:
         try:
             assert proc.stdin is not None
-            proc.stdin.write(user_prompt)
+            proc.stdin.write(stdin_text)
             proc.stdin.close()
         except (BrokenPipeError, OSError, ValueError):
             pass
@@ -513,16 +731,15 @@ def run_claude(
         threading.Thread(target=target, daemon=True).start()
 
     deadline = time.monotonic() + SPAWN_TIMEOUT
-    cur_text = ""                      # text of the assistant message in flight
-    cur_calls: List[Dict[str, Any]] = []
-    seen_call_ids: Set[str] = set()
+    cur_text = ""
+    seen_ids: Set[str] = set()
+    finished = False
     try:
         while True:
             try:
                 line = lines.get(timeout=1.0)
             except queue.Empty:
                 if time.monotonic() > deadline:
-                    _terminate(proc)
                     raise BridgeError(504, f"claude -p exceeded {int(SPAWN_TIMEOUT)}s", code="claude_timeout", etype="timeout_error")
                 if on_tick:
                     on_tick()
@@ -544,11 +761,15 @@ def run_claude(
                 other_lines.append(stripped)
                 continue
             etype = ev.get("type")
+            if ev.get("parent_tool_use_id") and etype in ("stream_event", "assistant", "user"):
+                continue  # subagent traffic: not the main thread's context or reply
             if etype == "system":
                 if ev.get("subtype") == "init":
                     if ev.get("model"):
                         run.model_ids = [str(ev["model"])]
                     run.api_key_source = str(ev.get("apiKeySource") or "")
+                    run.permission_mode = str(ev.get("permissionMode") or "")
+                    run.session_id = str(ev.get("session_id") or "")
             elif etype == "rate_limit_event":
                 info = ev.get("rate_limit_info") or {}
                 if isinstance(info, dict) and isinstance(info.get("unifiedWindows"), dict):
@@ -557,7 +778,7 @@ def run_claude(
                 e = ev.get("event") or {}
                 st = e.get("type")
                 if st == "message_start":
-                    cur_text, cur_calls, seen_call_ids = "", [], set()
+                    cur_text = ""
                 elif st == "content_block_delta":
                     d = e.get("delta") or {}
                     if d.get("type") == "text_delta":
@@ -572,11 +793,6 @@ def run_claude(
                         run.usage_last = u
                 elif st == "message_stop":
                     run.final_text = cur_text
-                    if cur_calls:
-                        run.intercepted = True
-                        run.native_calls = list(cur_calls)
-                        run.native_text = cur_text
-                        break
             elif etype == "assistant":
                 msg = ev.get("message") or {}
                 u = msg.get("usage")
@@ -586,16 +802,13 @@ def run_claude(
                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                         continue
                     name = str(block.get("name") or "")
-                    if name == STRUCTURED_TOOL:
-                        continue
                     bid = str(block.get("id") or "")
-                    if bid and bid in seen_call_ids:
+                    if name == STRUCTURED_TOOL or (bid and bid in seen_ids):
                         continue
-                    seen_call_ids.add(bid)
-                    if name in tool_names:
-                        cur_calls.append({"id": bid, "name": name, "input": block.get("input") if isinstance(block.get("input"), dict) else {}})
-                    else:
-                        log.warning("model called unknown native tool %r (not a Hermes tool); letting claude reject it", name)
+                    seen_ids.add(bid)
+                    run.native_tools.append(name)
+                    if name in hermes_names:
+                        run.misrouted.append(name)
             elif etype == "user":
                 if "No such tool available" in stripped:
                     run.unknown_tool_errors += 1
@@ -605,6 +818,8 @@ def run_claude(
                 run.structured = ev.get("structured_output")
                 run.is_error = bool(ev.get("is_error"))
                 run.subtype = str(ev.get("subtype") or "")
+                run.session_id = str(ev.get("session_id") or run.session_id)
+                run.permission_denials = len(ev.get("permission_denials") or [])
                 try:
                     run.num_turns = int(ev.get("num_turns") or 0)
                 except Exception:
@@ -614,27 +829,21 @@ def run_claude(
                 mu = ev.get("modelUsage")
                 if isinstance(mu, dict) and mu:
                     run.model_ids = list(mu.keys())
+        finished = True
     finally:
-        if run.intercepted:
+        if not finished:
             _terminate(proc)
-        _unlink(sys_path)
+            _close_pipes(proc)
 
     try:
         proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
         _terminate(proc)
-    for pipe in (proc.stdin, proc.stdout, proc.stderr):
-        try:
-            if pipe is not None:
-                pipe.close()
-        except Exception:
-            pass
+    _close_pipes(proc)
 
     if run.api_key_source and run.api_key_source != "none":
         log.warning("claude reports apiKeySource=%s — this spawn may be billing an API key, not the subscription", run.api_key_source)
 
-    if run.intercepted:
-        return run
     stderr_text = "".join(stderr_buf).strip()
     if run.saw_result:
         if run.is_error:
@@ -646,24 +855,177 @@ def run_claude(
     raise classify_error(tail or f"exit {proc.returncode} with no result event")
 
 
-def _unlink(path: str) -> None:
+def run_claude(
+    model: str,
+    effort: str,
+    system_prompt: str,
+    user_prompt: str,
+    schema: Optional[Dict[str, Any]] = None,
+    on_text: Optional[Callable[[str], None]] = None,
+    on_tick: Optional[Callable[[], None]] = None,
+    on_event: Optional[Callable[[str], None]] = None,
+) -> ClaudeRun:
+    """Stateless, tools-off spawn for requests without Hermes tools."""
+    _fake_error()
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="sys-", dir=str(SCRATCH_DIR), delete=False) as f:
+        f.write(system_prompt)
+        sys_path = f.name
+    cmd = [
+        CLAUDE_BIN, "-p",
+        "--safe-mode",
+        "--tools", "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--model", model,
+        "--effort", effort,
+        "--system-prompt-file", sys_path,
+    ]
+    if schema:
+        cmd += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
     try:
-        os.unlink(path)
-    except OSError:
-        pass
+        return spawn_claude(cmd, user_prompt, SCRATCH_DIR, on_text=on_text, on_tick=on_tick, on_event=on_event)
+    finally:
+        _unlink(sys_path)
+
+
+def harness_cmd(model: str, effort: str, sys_path: str, session_uuid: str, resume: bool, snapshot_off: bool) -> List[str]:
+    cmd = [
+        CLAUDE_BIN, "-p",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--permission-mode", PERMISSION_MODE,
+        "--permission-prompts", "none",
+        "--model", model,
+        "--effort", effort,
+        "--append-system-prompt-file", sys_path,
+        "--json-schema", json.dumps(OUTPUT_SCHEMA, separators=(",", ":")),
+    ]
+    cmd += ["--resume", session_uuid] if resume else ["--session-id", session_uuid]
+    if snapshot_off:
+        cmd += ["--system-prompt-snapshot", "off"]
+    return cmd
+
+
+class Turn:
+    """What one harness request did, for logging and the reply."""
+
+    def __init__(self) -> None:
+        self.key = ""
+        self.session = ""
+        self.resumed = False
+        self.delta = 0
+        self.dropped: List[str] = []
+        self.offered = 0
+        self.run: Optional[ClaudeRun] = None
+
+
+def harness_turn(
+    body: Dict[str, Any],
+    model: str,
+    effort: str,
+    on_tick: Optional[Callable[[], None]] = None,
+    on_event: Optional[Callable[[str], None]] = None,
+    store: Optional[SessionStore] = None,
+) -> Tuple[Turn, str, List[Dict[str, Any]]]:
+    """Run one Hermes request as a turn of its persistent Claude Code session."""
+    store = store or STORE
+    _fake_error()
+    system_text, rest = split_system(body.get("messages") or [])
+    offered, dropped = hermes_tools(body.get("tools") or [])
+    names = tool_name_set(offered)
+    note = f"Earlier instructions from Hermes may name {', '.join(dropped)}. Those Hermes tools are not\navailable here; use your own equivalents.\n\n" if dropped else ""
+    sys_prompt = (system_text or "").strip() + HARNESS_HEADER.replace("<<DROPPED>>", note) + (render_tools(offered) if offered else "(none in this conversation)")
+    tc = body.get("tool_choice")
+    if tc in ("required", "any") or isinstance(tc, dict):
+        sys_prompt += "\n\nFor this turn you must request at least one Hermes tool."
+    sp = text_hash(sys_prompt)
+    t = Turn()
+    t.key, t.dropped, t.offered = session_key(body, system_text, rest), dropped, len(offered)
+    call_names = {str(c.get("id")): str((c.get("function") or {}).get("name") or "") for m in rest for c in (m.get("tool_calls") or []) if isinstance(c, dict)}
+
+    lock = store.turn_lock(t.key)
+    if not lock.acquire(timeout=QUEUE_WAIT):
+        raise BridgeError(503, "another turn of this conversation is still running", code="session_busy", etype="overloaded_error")
+    try:
+        entry = store.get(t.key)
+        start = resume_point(rest, entry) if entry else None
+        adopted_from = ""
+        if start is None:
+            found = adopt(rest, t.key, store)
+            if found:
+                log.info("conversation %s continues Claude Code session %s from %s", t.key[:24], found[1]["uuid"][:8], found[0][:24])
+                adopted_from, entry, start = found
+        for attempt in (0, 1):
+            if start is not None and entry:
+                delta, history, t.resumed, t.session = rest[start:], [], True, entry["uuid"]
+                snapshot_off = bool(entry.get("sp_off")) or entry.get("sp") != sp
+            else:
+                last_asst = max((i for i, m in enumerate(rest) if m.get("role") == "assistant"), default=-1)
+                delta, history, t.resumed, t.session = rest[last_asst + 1:], rest[:last_asst + 1], False, str(uuid.uuid4())
+                snapshot_off = False
+            snapshot_off = snapshot_off and claude_supports("--system-prompt-snapshot")
+            t.delta = len(delta)
+            stdin_text = stream_json_line(turn_blocks(delta, history, call_names))
+            SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="append-", dir=str(SCRATCH_DIR), delete=False) as f:
+                f.write(sys_prompt)
+                sys_path = f.name
+            dump(f"{t.session[:8]}-{int(time.time())}-turn.jsonl", stdin_text)
+            try:
+                with _slot():
+                    t.run = spawn_claude(harness_cmd(model, effort, sys_path, t.session, t.resumed, snapshot_off), stdin_text, WORKDIR, hermes_names=names, on_tick=on_tick, on_event=on_event)
+                break
+            except BridgeError as err:
+                if err.code == "claude_session_missing" and t.resumed and attempt == 0:
+                    log.warning("session %s for %s is gone from Claude Code; starting a new one from the Hermes history", t.session[:8], t.key)
+                    start, entry = None, None
+                    continue
+                raise
+            finally:
+                _unlink(sys_path)
+        run = t.run
+        assert run is not None
+        content, tool_calls = run_to_message(run, "tools")
+        produced = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+        new_entry = {
+            "uuid": t.session,
+            "last": msg_hash(produced),
+            "fed": msg_hash(rest[-1]) if rest else "",
+            "sp": entry.get("sp") if (t.resumed and entry) else sp,
+            "sp_off": bool(t.resumed and entry and (entry.get("sp_off") or entry.get("sp") != sp)),
+            "created": entry.get("created") if (t.resumed and entry) else time.time(),
+            "turns": int(entry.get("turns") or 0) + 1 if (t.resumed and entry) else 1,
+        }
+        if adopted_from and t.resumed:
+            store.drop(adopted_from)
+        store.put(t.key, new_entry)
+        if run.permission_mode and run.permission_mode != PERMISSION_MODE:
+            log.warning("claude reports permissionMode=%s, asked for %s", run.permission_mode, PERMISSION_MODE)
+        if run.misrouted or run.unknown_tool_errors:
+            log.warning("model called Hermes tool(s) natively %s; Claude Code rejected %d call(s)", run.misrouted, run.unknown_tool_errors)
+        return t, content, tool_calls
+    finally:
+        lock.release()
+
+
+class _slot:
+    def __enter__(self):
+        if not _slots.acquire(timeout=QUEUE_WAIT):
+            raise BridgeError(503, "bridge busy: too many concurrent claude runs", code="busy", etype="overloaded_error")
+
+    def __exit__(self, *exc):
+        _slots.release()
 
 
 def run_to_message(run: ClaudeRun, mode: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Return (content, openai_tool_calls) for the given prompt mode."""
-    if run.intercepted:
-        calls_out = []
-        for c in run.native_calls:
-            calls_out.append({
-                "id": "call_" + uuid.uuid4().hex[:24],
-                "type": "function",
-                "function": {"name": c["name"], "arguments": json.dumps(c.get("input") or {}, ensure_ascii=False)},
-            })
-        return run.native_text, calls_out
+    """Return (content, openai_tool_calls) for the given mode."""
     structured = run.structured
     if isinstance(structured, str):
         try:
@@ -673,7 +1035,6 @@ def run_to_message(run: ClaudeRun, mode: str) -> Tuple[str, List[Dict[str, Any]]
     result = run.result_text
     if mode == "tools":
         if not isinstance(structured, dict) and result:
-            # schema requested but structured_output missing: try the text itself
             try:
                 parsed = json.loads(result)
                 if isinstance(parsed, dict) and "content" in parsed:
@@ -703,30 +1064,15 @@ def run_to_message(run: ClaudeRun, mode: str) -> Tuple[str, List[Dict[str, Any]]
     return result or run.final_text, []
 
 
-# kept for callers/tests that still hold a raw result dict
-def claude_result_to_message(data: Dict[str, Any], mode: str) -> Tuple[str, List[Dict[str, Any]]]:
-    run = ClaudeRun()
-    run.saw_result = True
-    run.result_text = str(data.get("result") or "")
-    run.structured = data.get("structured_output")
-    return run_to_message(run, mode)
-
-
 def usage_from(run: ClaudeRun) -> Dict[str, int]:
-    """OpenAI usage block from the LAST API call of the spawn.
-
-    The result event's usage is summed over every internal turn (a
-    "[structured-output-enforce]" re-prompt or a rejected native tool call
-    doubles it), which made Hermes think a 160k context was 660k and
-    auto-compress every turn. The last call's input is the real context.
-    """
+    """OpenAI usage from the LAST API call of the spawn (the result event
+    sums every internal call, which made Hermes over-count its context)."""
     u = run.usage_last or run.usage_total or {}
     inp = int(u.get("input_tokens") or 0)
     cr = int(u.get("cache_read_input_tokens") or 0)
     cw = int(u.get("cache_creation_input_tokens") or 0)
     out = int(u.get("output_tokens") or 0)
     if run.usage_total and run.usage_last is not run.usage_total:
-        # output of the whole spawn is what the user paid for; report that
         out = int(run.usage_total.get("output_tokens") or out)
     return {
         "prompt_tokens": inp + cr + cw,
@@ -754,17 +1100,10 @@ def rate_limit_summary(run: ClaudeRun) -> str:
 
 def models_payload() -> Dict[str, Any]:
     now = int(time.time())
-    items = []
-    for m in MODEL_ALIASES + MODEL_IDS:
-        items.append({
-            "id": m,
-            "object": "model",
-            "created": now,
-            "owned_by": "claude-bridge",
-            "context_length": CONTEXT_LENGTH,
-            "max_input_tokens": CONTEXT_LENGTH,
-        })
-    return {"object": "list", "data": items}
+    return {"object": "list", "data": [
+        {"id": m, "object": "model", "created": now, "owned_by": "claude-bridge", "context_length": CONTEXT_LENGTH, "max_input_tokens": CONTEXT_LENGTH}
+        for m in MODEL_ALIASES + MODEL_IDS
+    ]}
 
 
 def dump(name: str, payload: Any) -> None:
@@ -774,11 +1113,8 @@ def dump(name: str, payload: Any) -> None:
         d = Path(DUMP_DIR)
         d.mkdir(parents=True, exist_ok=True)
         p = d / name
-        if isinstance(payload, str):
-            p.write_text(payload)
-        else:
-            p.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    except Exception as exc:  # debugging aid only
+        p.write_text(payload if isinstance(payload, str) else json.dumps(payload, indent=2, ensure_ascii=False))
+    except Exception as exc:
         log.warning("dump %s failed: %s", name, exc)
 
 
@@ -786,10 +1122,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"claude-bridge/{__version__}"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):  # quiet; we log ourselves
+    def log_message(self, fmt, *args):
         return
 
-    # -- responses --
     def _json(self, status: int, payload: Dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -805,13 +1140,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
-    # -- routes --
+    def _client_gone(self) -> bool:
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            return bool(r) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except Exception:
+            return True
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path in ("/v1/models", "/models"):
             return self._json(200, models_payload())
         if path == "/health":
-            return self._json(200, {"ok": True, "version": __version__, "claude_bin": CLAUDE_BIN, "claude_version": SERVER_STATE.get("claude_version")})
+            return self._json(200, {
+                "ok": True, "version": __version__, "claude_bin": CLAUDE_BIN, "claude_version": SERVER_STATE.get("claude_version"),
+                "workdir": str(WORKDIR), "permission_mode": PERMISSION_MODE, "sessions": len(STORE),
+            })
         return self._error(BridgeError(404, f"no route {path}", code="not_found"))
 
     def do_POST(self) -> None:
@@ -832,17 +1176,9 @@ class Handler(BaseHTTPRequestHandler):
         effort, effort_src = effort_with_source(body)
         stream = bool(body.get("stream"))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-        try:
-            system_prompt, user_prompt, mode, schema = build_prompts(body)
-        except Exception as exc:
-            return self._error(BridgeError(400, f"could not render messages: {exc}", code="bad_request", etype="invalid_request_error"))
-        tools = body.get("tools") or []
-        n_tools = len(tools)
-        tool_names = tool_name_set(tools) if mode == "tools" else set()
+        harness = wants_harness(body)
         n_msgs = len(body.get("messages") or [])
         dump(f"{req_id}-request.json", body)
-        dump(f"{req_id}-system.txt", system_prompt)
-        dump(f"{req_id}-prompt.txt", user_prompt)
         event_lines: List[str] = []
 
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -852,7 +1188,7 @@ class Handler(BaseHTTPRequestHandler):
         def chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> Dict[str, Any]:
             return {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason, "logprobs": None}]}
 
-        sent = {"headers": False, "last": time.monotonic()}
+        sent = {"headers": False, "last": time.monotonic(), "probe": 0.0}
 
         def start_stream() -> None:
             if sent["headers"]:
@@ -872,27 +1208,41 @@ class Handler(BaseHTTPRequestHandler):
             sent["last"] = time.monotonic()
 
         def on_tick() -> None:
-            # The tool loop keeps real HTTP status codes (no early headers);
-            # aux/text calls get keep-alives so Hermes sees progress.
-            if mode == "tools" and not sent["headers"]:
-                return
-            if time.monotonic() - sent["last"] >= HEARTBEAT_SECONDS:
-                start_stream()
-                self._sse(chunk({}))
+            now = time.monotonic()
+            if now - sent["probe"] >= 1.0:
+                sent["probe"] = now
+                if self._client_gone():
+                    raise ClientGone()
+            if stream and now - sent["last"] >= HEARTBEAT_SECONDS:
+                try:
+                    start_stream()
+                    self._sse(chunk({}))
+                except OSError:
+                    raise ClientGone()
                 sent["last"] = time.monotonic()
 
-        if not _slots.acquire(timeout=QUEUE_WAIT):
-            return self._error(BridgeError(503, "bridge busy: too many concurrent claude runs", code="busy", etype="overloaded_error"))
+        turn: Optional[Turn] = None
+        mode = "tools" if harness else "text"
         try:
-            run = run_claude(
-                model, effort, system_prompt, user_prompt, schema,
-                tool_names=tool_names,
-                on_text=on_text if (stream and mode == "text") else None,
-                on_tick=on_tick if stream else None,
-                on_event=event_lines.append if DUMP_DIR else None,
-            )
+            if harness:
+                turn, content, tool_calls = harness_turn(body, model, effort, on_tick=on_tick, on_event=event_lines.append if DUMP_DIR else None)
+                run = turn.run
+                assert run is not None
+            else:
+                system_prompt, user_prompt, mode, schema = build_prompts(body)
+                with _slot():
+                    run = run_claude(
+                        model, effort, system_prompt, user_prompt, schema,
+                        on_text=on_text if (stream and mode == "text") else None,
+                        on_tick=on_tick,
+                        on_event=event_lines.append if DUMP_DIR else None,
+                    )
+                content, tool_calls = run_to_message(run, mode)
+        except ClientGone:
+            log.info("req=%s client went away after %.1fs; claude stopped", req_id, time.time() - t0)
+            return
         except BridgeError as err:
-            log.warning("req=%s model=%s effort=%s(%s) mode=%s msgs=%d tools=%d -> %d %s (%.1fs)", req_id, model, effort, effort_src, mode, n_msgs, n_tools, err.status, err.code, time.time() - t0)
+            log.warning("req=%s model=%s effort=%s(%s) mode=%s msgs=%d -> %d %s (%.1fs)", req_id, model, effort, effort_src, mode, n_msgs, err.status, err.code, time.time() - t0)
             if stream and sent["headers"]:
                 self._sse({"error": {"message": err.message, "type": err.etype, "code": err.code, "param": None}})
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -908,24 +1258,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._error(BridgeError(500, f"bridge failure: {exc}", code="bridge_error"))
         finally:
-            _slots.release()
             if event_lines:
                 dump(f"{req_id}-events.jsonl", "".join(event_lines))
 
-        content, tool_calls = run_to_message(run, mode)
         usage = usage_from(run)
         finish = "tool_calls" if tool_calls else "stop"
         actual_model = ",".join(run.model_ids) or model
-        dump(f"{req_id}-claude.json", {"result": run.result_text, "structured_output": run.structured, "intercepted": run.intercepted, "native_calls": run.native_calls, "usage_last": run.usage_last, "usage_total": run.usage_total, "num_turns": run.num_turns})
+        where = ""
+        if turn:
+            where = f" key={turn.key[:24]} session={turn.session[:8]}{' resume' if turn.resumed else ' new'} delta={turn.delta} hermes_tools={turn.offered} native={len(run.native_tools)}"
+            if run.permission_denials:
+                where += f" denied={run.permission_denials}"
         log.info(
-            "req=%s model=%s(%s) effort=%s(%s) mode=%s msgs=%d tools=%d stream=%d -> 200 %s calls=%d%s turns=%d in=%d cached=%d out=%d %.1fs%s",
-            req_id, model, actual_model, effort, effort_src, mode, n_msgs, n_tools, int(stream), finish,
-            len(tool_calls), " native" if run.intercepted else "", run.num_turns,
+            "req=%s model=%s(%s) effort=%s(%s) mode=%s msgs=%d stream=%d%s -> 200 %s calls=%d turns=%d in=%d cached=%d out=%d %.1fs%s",
+            req_id, model, actual_model, effort, effort_src, mode, n_msgs, int(stream), where, finish,
+            len(tool_calls), run.num_turns,
             usage["prompt_tokens"], usage["prompt_tokens_details"]["cached_tokens"], usage["completion_tokens"], time.time() - t0,
             (" " + rate_limit_summary(run)) if run.rate_limit else "",
         )
-        if run.unknown_tool_errors:
-            log.warning("req=%s claude rejected %d native tool call(s) before the model answered; check the tool protocol prompt", req_id, run.unknown_tool_errors)
 
         if not stream:
             message: Dict[str, Any] = {"role": "assistant", "content": content if content else None}
@@ -939,26 +1289,28 @@ class Handler(BaseHTTPRequestHandler):
             dump(f"{req_id}-response.json", payload)
             return self._json(200, payload)
 
-        start_stream()
-        remaining = content
-        if run.text_streamed:
-            if content.startswith(run.text_streamed):
-                remaining = content[len(run.text_streamed):]
-            else:
-                log.warning("req=%s streamed text diverged from the final result; not re-sending", req_id)
-                remaining = ""
-        if remaining:
+        try:
+            start_stream()
+            remaining = content
+            if run.text_streamed:
+                if content.startswith(run.text_streamed):
+                    remaining = content[len(run.text_streamed):]
+                else:
+                    log.warning("req=%s streamed text diverged from the final result; not re-sending", req_id)
+                    remaining = ""
             step = 400
             for i in range(0, len(remaining), step):
                 self._sse(chunk({"content": remaining[i:i + step]}))
-        for idx, tc in enumerate(tool_calls):
-            self._sse(chunk({"tool_calls": [{"index": idx, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": ""}}]}))
-            self._sse(chunk({"tool_calls": [{"index": idx, "function": {"arguments": tc["function"]["arguments"]}}]}))
-        self._sse(chunk({}, finish))
-        if include_usage:
-            self._sse({**base, "choices": [], "usage": usage})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+            for idx, tc in enumerate(tool_calls):
+                self._sse(chunk({"tool_calls": [{"index": idx, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": ""}}]}))
+                self._sse(chunk({"tool_calls": [{"index": idx, "function": {"arguments": tc["function"]["arguments"]}}]}))
+            self._sse(chunk({}, finish))
+            if include_usage:
+                self._sse({**base, "choices": [], "usage": usage})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except OSError:
+            log.warning("req=%s client went away before the reply was written", req_id)
 
 
 SERVER_STATE: Dict[str, Any] = {}
@@ -966,7 +1318,7 @@ SERVER_STATE: Dict[str, Any] = {}
 
 def probe_claude() -> None:
     try:
-        out = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True, text=True, timeout=30, env=child_env(), cwd=str(WORKDIR))
+        out = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True, text=True, timeout=30, env=child_env(), cwd=str(SCRATCH_DIR))
         SERVER_STATE["claude_version"] = (out.stdout or out.stderr).strip()
     except Exception as exc:
         SERVER_STATE["claude_version"] = f"unavailable: {exc}"
@@ -974,14 +1326,14 @@ def probe_claude() -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Hermes → claude -p loopback bridge")
+    ap = argparse.ArgumentParser(description="Hermes → Claude Code loopback bridge")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    WORKDIR.mkdir(parents=True, exist_ok=True)
+    for d in (STATE_DIR, SCRATCH_DIR, WORKDIR):
+        d.mkdir(parents=True, exist_ok=True)
     handlers: List[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     try:
         handlers.append(logging.FileHandler(str(LOG_FILE)))
@@ -990,10 +1342,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         log.warning("binding to %s — this bridge has no auth; keep it on loopback", args.host)
-    probe_claude()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
-    log.info("claude-bridge %s listening on http://%s:%d (concurrency=%d, effort default=%s, context=%d, heartbeat=%ss)", __version__, args.host, args.port, MAX_CONCURRENCY, DEFAULT_EFFORT, CONTEXT_LENGTH, int(HEARTBEAT_SECONDS))
+    threading.Thread(target=probe_claude, daemon=True).start()
+    log.info("claude-bridge %s listening on http://%s:%d (concurrency=%d, workdir=%s, permission=%s, drop=%d tools, context=%d, heartbeat=%ss)",
+             __version__, args.host, args.port, MAX_CONCURRENCY, WORKDIR, PERMISSION_MODE, len(DROP_TOOLS), CONTEXT_LENGTH, int(HEARTBEAT_SECONDS))
     if FAKE_ERROR:
         log.warning("CLAUDE_BRIDGE_FAKE_ERROR=%s is set — every request returns a canned error", FAKE_ERROR)
     try:
