@@ -15,10 +15,12 @@ import contextvars
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -33,7 +35,8 @@ LOGIN_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_LOGIN_TIMEOUT", "600"))
 USAGE = "Usage: /login (start), /login status, /login logout, /login cancel"
 
 _ORIGIN: contextvars.ContextVar = contextvars.ContextVar("claude_login_origin", default=None)
-_RECENT: Dict[str, Any] = {"origin": None, "ts": 0.0}
+SWALLOW: Dict[Tuple[str, str, str], float] = {}
+MAX_MESSAGE = 1900
 PENDING: Dict[Tuple[str, str, str], relay.LoginSession] = {}
 BRIDGE = os.environ.get("CLAUDE_CLI_BRIDGE_BASE_URL", "http://127.0.0.1:8790/v1").rstrip("/")
 APPROVALS: Dict[Tuple[str, str], list] = {}
@@ -129,9 +132,22 @@ def sender(o: Origin):
     return send
 
 
+def _provider():
+    try:
+        from providers import get_provider_profile
+        return get_provider_profile("claude-cli")
+    except Exception:
+        return None
+
+
+def _token() -> str:
+    p = _provider()
+    return (p.bridge_token() if p is not None and hasattr(p, "bridge_token") else None) or ""
+
+
 def bridge_call(method: str, path: str, body: Optional[dict] = None, timeout: float = 10) -> Tuple[int, dict]:
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(BRIDGE + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(BRIDGE + path, data=data, method=method, headers={"Content-Type": "application/json", "X-Bridge-Token": _token()})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"{}")
@@ -143,6 +159,26 @@ def bridge_call(method: str, path: str, body: Optional[dict] = None, timeout: fl
                 return e.code, {}
 
 
+def chunks(text: str, limit: int = MAX_MESSAGE) -> list:
+    """Split on line boundaries so each piece fits a chat message."""
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
 def _send_to(platform: str, chat_id: str, thread_id: str, text: str) -> None:
     gateway, loop = _GATEWAY["gateway"], _GATEWAY["loop"]
     adapter = None
@@ -150,73 +186,118 @@ def _send_to(platform: str, chat_id: str, thread_id: str, text: str) -> None:
         if str(getattr(k, "value", k)) == platform:
             adapter = a
     if adapter is None or loop is None:
-        logger.warning("claude-login: no adapter for %s, approval prompt not delivered", platform)
+        logger.warning("claude-login: no adapter for %s, message not delivered", platform)
         return
-    coro = adapter.send(chat_id, text, metadata={"thread_id": thread_id} if thread_id else None)
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
         running = None
-    if running is loop:
-        loop.create_task(coro)
-        return
-    try:
-        asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
-    except Exception as exc:
-        logger.warning("claude-login: approval send failed: %s", exc)
+    for piece in chunks(text):
+        coro = adapter.send(chat_id, piece, metadata={"thread_id": thread_id} if thread_id else None)
+        if running is loop:
+            loop.create_task(coro)
+            continue
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
+        except Exception as exc:
+            logger.warning("claude-login: send failed: %s", exc)
 
 
 def poll_approvals(stop: Optional[threading.Event] = None, wait: float = 25) -> None:
-    after = 0
+    after, instance = 0, ""
     while not (stop and stop.is_set()):
         try:
             status, data = bridge_call("GET", f"/approvals?after={after}&wait={wait}", timeout=wait + 15)
         except Exception:
             time.sleep(3)
             continue
+        if status == 401:
+            p = _provider()
+            if p is not None and hasattr(p, "ensure_bridge"):
+                p.ensure_bridge(force=True, takeover=True)
+            time.sleep(3)
+            continue
         if status != 200:
             time.sleep(3)
             continue
-        seq = int(data.get("seq") or 0)
-        if seq < after:  # bridge restarted
-            after = 0
-            continue
+        if data.get("instance") != instance:  # a new bridge process: its ids start over
+            if instance:
+                with _APPROVAL_LOCK:
+                    APPROVALS.clear()
+                after, instance = 0, str(data.get("instance") or "")
+                continue
+            instance = str(data.get("instance") or "")
         for item in data.get("approvals") or []:
             key = (str(item.get("platform")), str(item.get("chat_id")))
+            state = item.get("state")
             with _APPROVAL_LOCK:
                 lst = APPROVALS.setdefault(key, [])
                 known = any(i["id"] == item["id"] for i in lst)
-                if item.get("state") == "pending":
+                if state == "pending":
                     if not known:
                         lst.append(item)
                 else:
                     lst[:] = [i for i in lst if i["id"] != item["id"]]
-            if item.get("state") == "pending" and not known:
-                _send_to(key[0], key[1], str(item.get("thread_id") or ""), str(item.get("text") or ""))
-            elif item.get("state") == "timeout" and known:
-                _send_to(key[0], key[1], str(item.get("thread_id") or ""), f"No answer in time; Claude Code was told no ({item.get('tool')}).")
-        after = seq
+            thread = str(item.get("thread_id") or "")
+            if state == "pending" and not known:
+                _send_to(key[0], key[1], thread, str(item.get("text") or ""))
+            elif state == "notice":
+                _send_to(key[0], key[1], thread, str(item.get("text") or ""))
+            elif state == "timeout" and known:
+                _send_to(key[0], key[1], thread, f"[{item.get('short')}] No answer in time; Claude Code was told no ({item.get('tool')}).")
+        after = int(data.get("seq") or after)
+
+
+_ID_FIRST = re.compile(r"^#?(\w+)\s+(.+)$", re.S)
+_ID_LAST = re.compile(r"^(y|yes|n|no)\s+#?(\w+)$", re.I)
+
+
+def pick_approval(o: Origin, text: str) -> Tuple[Optional[dict], str, bool]:
+    """(item, reply, ambiguous) for a chat message. The replier's own pending
+    requests come first; admins may answer others'. With several open, the
+    reply must name one: "y 12", "n 12" or "12 <reason>"."""
+    with _APPROVAL_LOCK:
+        lst = list(APPROVALS.get((o.platform, o.chat_id), []))
+    own = [i for i in lst if str(i.get("user_id")) == o.user_id]
+    cands = own or ([i for i in lst if allowed(o)] if lst else [])
+    if not cands:
+        return None, text, False
+    by_short = {str(i.get("short")): i for i in cands}
+    m = _ID_LAST.match(text.strip())
+    if m and m.group(2) in by_short:
+        return by_short[m.group(2)], m.group(1), False
+    m = _ID_FIRST.match(text.strip())
+    if m and m.group(1) in by_short and len(cands) > 1:
+        return by_short[m.group(1)], m.group(2), False
+    if len(cands) == 1:
+        return cands[0], text, False
+    return None, text, True
 
 
 def _answer_approval(o: Origin, text: str) -> bool:
+    item, reply, ambiguous = pick_approval(o, text)
+    if ambiguous:
+        _send_to(o.platform, o.chat_id, o.thread_id, "Several approvals are open. Reply `y <number>`, `n <number>` or `<number> <reason>`.")
+        return True
+    if item is None:
+        return False
     with _APPROVAL_LOCK:
-        lst = list(APPROVALS.get((o.platform, o.chat_id), []))
-    for item in lst:
-        if o.user_id != str(item.get("user_id")) and not allowed(o):
-            continue
+        cur = APPROVALS.get((o.platform, o.chat_id), [])
+        cur[:] = [i for i in cur if i["id"] != item["id"]]
+
+    def post() -> None:
         try:
-            status, data = bridge_call("POST", f"/approvals/{item['id']}", {"user_id": o.user_id, "platform": o.platform, "text": text}, timeout=5)
-        except Exception:
-            return False
-        if status in (200, 404):
-            with _APPROVAL_LOCK:
-                cur = APPROVALS.get((o.platform, o.chat_id), [])
-                cur[:] = [i for i in cur if i["id"] != item["id"]]
+            status, data = bridge_call("POST", f"/approvals/{item['id']}", {"user_id": o.user_id, "platform": o.platform, "text": reply}, timeout=10)
+        except Exception as exc:
+            status, data = 0, {"error": str(exc)}
         if status == 200:
             if item.get("tool") != "AskUserQuestion":
-                _send_to(o.platform, o.chat_id, o.thread_id, "Allowed." if data.get("decision") == "allow" else "Denied.")
-            return True
-    return False
+                _send_to(o.platform, o.chat_id, o.thread_id, f"[{item.get('short')}] " + ("Allowed." if data.get("decision") == "allow" else "Denied."))
+        else:
+            _send_to(o.platform, o.chat_id, o.thread_id, f"[{item.get('short')}] Your answer was not taken ({data.get('error') or status}); it did not reach the agent either.")
+
+    threading.Thread(target=post, name="claude-approval-answer", daemon=True).start()
+    return True
 
 
 def _capture_gateway(gateway: Any, loop: Optional[asyncio.AbstractEventLoop]) -> None:
@@ -226,6 +307,9 @@ def _capture_gateway(gateway: Any, loop: Optional[asyncio.AbstractEventLoop]) ->
     if _GATEWAY["poller"] is None:
         _GATEWAY["poller"] = threading.Thread(target=poll_approvals, name="claude-approvals", daemon=True)
         _GATEWAY["poller"].start()
+        p = _provider()
+        if p is not None and hasattr(p, "ensure_bridge") and not _token():
+            threading.Thread(target=p.ensure_bridge, kwargs={"force": True, "takeover": True}, daemon=True).start()
 
 
 def on_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> Optional[dict]:
@@ -240,17 +324,21 @@ def on_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> Optional[di
             loop = None
         o = Origin(source, gateway, loop)
         _capture_gateway(gateway, loop)
+        plain = bool(text) and not text.startswith("/")
         sess = PENDING.get(o.key)
-        if sess is not None and sess.alive() and text and not text.startswith("/"):
+        if sess is not None and sess.alive() and plain:
             sess.write(text)
             return {"action": "skip", "reason": "claude login input"}
-        if text and not text.startswith("/") and _answer_approval(o, text):
+        if plain and SWALLOW.get(o.key, 0) > time.monotonic():
+            SWALLOW.pop(o.key, None)
+            _send_to(o.platform, o.chat_id, o.thread_id, "That message was held back: the Claude Code sign-in had already ended, and it may have been a code. Send it again if it was meant for the agent, or /login to retry.")
+            return {"action": "skip", "reason": "claude login ended"}
+        if plain and _answer_approval(o, text):
             return {"action": "skip", "reason": "claude approval answer"}
         if text.startswith("/"):
             head = text[1:].split(maxsplit=1)[0].split("@")[0].lower().replace("_", "-") if len(text) > 1 else ""
             if head in COMMANDS:
                 _ORIGIN.set(o)
-                _RECENT.update(origin=o, ts=time.monotonic())
     except Exception:
         logger.debug("claude-login: dispatch hook failed", exc_info=True)
     return None
@@ -265,8 +353,11 @@ def _start(o: Origin) -> str:
     def finished(rc: int) -> None:
         if PENDING.get(o.key) is sess:
             PENDING.pop(o.key, None)
+        status = status_text()
+        if rc != 0 or sess.timed_out or not status.startswith("Claude Code is signed in"):
+            SWALLOW[o.key] = time.monotonic() + LOGIN_TIMEOUT
         note = "Sign-in timed out after 10 minutes. " if sess.timed_out else ""
-        send(note + status_text())
+        send(note + status)
 
     sess = relay.LoginSession([claude_bin(), "auth", "login", "--claudeai"], claude_env(), send=send, on_exit=finished, timeout=LOGIN_TIMEOUT, cwd=str(Path.home()))
     try:
@@ -274,6 +365,7 @@ def _start(o: Origin) -> str:
     except Exception as exc:
         return f"Could not start `claude auth login`: {exc}"
     PENDING[o.key] = sess
+    SWALLOW.pop(o.key, None)
     return ("Starting Claude Code sign-in. I'll post the link here: open it, approve, then paste the code "
             "you get back as a normal message. It goes straight to Claude Code; the agent never sees it. "
             "/login cancel stops it.")
@@ -291,12 +383,34 @@ def _cli(sub: str) -> str:
     return f"No chat to relay to. Run `{claude_bin()} auth login` in a terminal as this Hermes user (HOME={Path.home()})."
 
 
+def invoking_origin() -> Optional[Origin]:
+    """Who ran the command: Hermes's session context when it is set, else the
+    origin the dispatch hook recorded for this same message (task-local)."""
+    try:
+        from gateway.session_context import get_session_env
+        plat, chat, user = (get_session_env(f"HERMES_SESSION_{k}", "") for k in ("PLATFORM", "CHAT_ID", "USER_ID"))
+    except Exception:
+        plat = chat = user = ""
+    hooked = _ORIGIN.get()
+    if plat and chat and user and _GATEWAY["gateway"] is not None:
+        if hooked is not None and hooked.key == (plat, chat, user):
+            return hooked
+        src = getattr(hooked, "source", None)
+        if src is None:
+            for k in (getattr(_GATEWAY["gateway"], "adapters", None) or {}):
+                if str(getattr(k, "value", k)) == plat:
+                    src = types.SimpleNamespace(platform=k, chat_id=chat, user_id=user, thread_id="")
+        if src is not None:
+            o = Origin(src, _GATEWAY["gateway"], _GATEWAY["loop"])
+            o.platform, o.chat_id, o.user_id = plat, chat, user
+            return o
+    return hooked
+
+
 def command(raw_args: str = "") -> str:
     parts = (raw_args or "").strip().split()
     sub = parts[0].lower() if parts else "start"
-    o = _ORIGIN.get()
-    if o is None and time.monotonic() - float(_RECENT["ts"]) < 15:
-        o = _RECENT["origin"]
+    o = invoking_origin()
     if o is None or o.gateway is None:
         return _cli(sub)
     if not allowed(o):
@@ -323,13 +437,12 @@ def command(raw_args: str = "") -> str:
 
 
 def _ensure_bridge() -> None:
-    try:
-        from providers import get_provider_profile
-        p = get_provider_profile("claude-cli")
-        if p is not None and hasattr(p, "ensure_bridge"):
+    p = _provider()
+    if p is not None and hasattr(p, "ensure_bridge"):
+        try:
             p.ensure_bridge(force=True)
-    except Exception:
-        logger.debug("claude-login: bridge autostart skipped", exc_info=True)
+        except Exception:
+            logger.debug("claude-login: bridge autostart skipped", exc_info=True)
 
 
 def register(ctx: Any) -> None:

@@ -11,11 +11,15 @@ Never the built-in `anthropic` OAuth provider alongside it.
 """
 from __future__ import annotations
 
+import json
 import os
+import secrets
+import signal
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -26,6 +30,7 @@ from providers.base import OMIT_TEMPERATURE, ProviderProfile
 _EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 SESSION_FIELD = "claude_bridge_session"
 ORIGIN_FIELD = "claude_bridge_origin"
+FORK_FIELD = "claude_bridge_fork"
 BASE_URL = os.environ.get("CLAUDE_CLI_BRIDGE_BASE_URL", "http://127.0.0.1:8790/v1")
 CHECK_EVERY = 20.0
 
@@ -40,23 +45,81 @@ def _bridge_script() -> Path | None:
     return None
 
 
+def _state_dir() -> Path:
+    home = Path.home()
+    default = home / ".hermes" / "claude-bridge" if (home / ".hermes").is_dir() else home / "claude-bridge"
+    return Path(os.environ.get("CLAUDE_BRIDGE_STATE_DIR", "") or default)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 class _Supervisor:
+    """Starts the bridge and holds its approvals control token in memory.
+
+    The token goes to the bridge over an inherited pipe (never env or disk).
+    A bridge this process did not start is left alone while its owner lives;
+    an orphan (owner gone, e.g. a previous gateway) is replaced.
+    """
+
     def __init__(self, base_url: str) -> None:
         u = urllib.parse.urlparse(base_url)
         self.host, self.port = u.hostname or "127.0.0.1", u.port or 8790
-        self.health = f"{u.scheme}://{self.host}:{self.port}/health"
+        self.root = f"{u.scheme}://{self.host}:{self.port}"
         self.checked = 0.0
         self.proc: subprocess.Popen | None = None
+        self.token: str | None = None
         self.lock = threading.Lock()
 
-    def up(self, timeout: float = 1.0) -> bool:
+    def health(self, timeout: float = 1.0) -> dict | None:
         try:
-            with urllib.request.urlopen(self.health, timeout=timeout) as r:
+            with urllib.request.urlopen(self.root + "/health", timeout=timeout) as r:
+                return json.loads(r.read() or b"{}") if r.status == 200 else None
+        except Exception:
+            return None
+
+    def up(self, timeout: float = 1.0) -> bool:
+        return self.health(timeout) is not None
+
+    def authorized(self) -> bool:
+        if not self.token:
+            return False
+        req = urllib.request.Request(self.root + "/v1/approvals?after=0&wait=0", headers={"X-Bridge-Token": self.token})
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
                 return r.status == 200
         except Exception:
             return False
 
-    def ensure(self, force: bool = False) -> None:
+    def _replace(self, health: dict) -> bool:
+        try:
+            info = json.loads((_state_dir() / "bridge.pid").read_text())
+        except Exception:
+            return False
+        pid = int(info.get("pid") or 0)
+        if not pid or pid != int(health.get("pid") or -1):
+            return False
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return False
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and self.up(0.5):
+            time.sleep(0.25)
+        if self.up(0.5):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            time.sleep(0.5)
+        return not self.up(0.5)
+
+    def ensure(self, force: bool = False, takeover: bool = False) -> None:
         if os.environ.get("CLAUDE_BRIDGE_AUTOSTART", "1") == "0" or self.host not in ("127.0.0.1", "localhost"):
             return
         now = time.monotonic()
@@ -68,31 +131,73 @@ class _Supervisor:
             self.checked = now
             if self.proc is not None:
                 self.proc.poll()
-            if self.up():
-                return
-            script = _bridge_script()
-            if script is None:
-                return
-            home = Path.home()
-            default = home / ".hermes" / "claude-bridge" if (home / ".hermes").is_dir() else home / "claude-bridge"
-            log_dir = Path(os.environ.get("CLAUDE_BRIDGE_STATE_DIR", "") or default)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with open(log_dir / "bridge.log", "ab") as out:
-                self.proc = subprocess.Popen(
-                    [sys.executable, str(script), "--host", self.host, "--port", str(self.port)],
-                    stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True,
-                    env={**os.environ, "CLAUDE_BRIDGE_STATE_DIR": str(log_dir)},
-                )
-            deadline = time.monotonic() + 8
-            while time.monotonic() < deadline and self.proc.poll() is None and not self.up(0.5):
-                time.sleep(0.25)
+            health = self.health()
+            if health is not None:
+                if self.authorized():
+                    return
+                try:
+                    owner = int(json.loads((_state_dir() / "bridge.pid").read_text()).get("owner") or 0)
+                except Exception:
+                    return  # not started by this plugin (e.g. a LaunchAgent): leave it
+                if owner and owner != os.getpid() and _alive(owner) and not takeover:
+                    return
+                if not self._replace(health):
+                    return
+            self._spawn()
         except Exception:
             pass
         finally:
             self.lock.release()
 
+    def _spawn(self) -> None:
+        script = _bridge_script()
+        if script is None:
+            return
+        state = _state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(32)
+        r, w = os.pipe()
+        try:
+            os.write(w, token.encode())
+        finally:
+            os.close(w)
+        try:
+            with open(state / "bridge.out", "ab") as out:
+                self.proc = subprocess.Popen(
+                    [sys.executable, str(script), "--host", self.host, "--port", str(self.port), "--token-fd", str(r), "--owner-pid", str(os.getpid())],
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True, pass_fds=(r,),
+                    env={**os.environ, "CLAUDE_BRIDGE_STATE_DIR": str(state)},
+                )
+        finally:
+            os.close(r)
+        self.token = token
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and self.proc.poll() is None and not self.up(0.5):
+            time.sleep(0.25)
+
 
 SUPERVISOR = _Supervisor(BASE_URL)
+
+
+def _calling_agent():
+    """The Hermes AIAgent whose request is being built (a local of
+    build_api_kwargs and friends), or None."""
+    f = sys._getframe(2)
+    for _ in range(30):
+        if f is None:
+            return None
+        for name in ("agent", "self"):
+            a = f.f_locals.get(name)
+            if a is not None and hasattr(a, "session_id") and hasattr(a, "_memory_write_origin"):
+                return a
+        f = f.f_back
+    return None
+
+
+def _is_fork(agent) -> bool:
+    """Background review / curator forks reuse the user's session id but are
+    not user turns (agent/background_review.py, v0.20.4 and later)."""
+    return bool(agent is not None and (getattr(agent, "_persist_disabled", False) or getattr(agent, "_memory_write_origin", "") == "background_review"))
 
 
 def _origin() -> dict:
@@ -109,20 +214,30 @@ class ClaudeCliProfile(ProviderProfile):
     """Declarative profile plus hooks: `/effort` → top-level reasoning_effort,
     conversation key and chat origin → extra_body, bridge kept alive."""
 
-    def ensure_bridge(self, force: bool = False) -> None:
-        SUPERVISOR.ensure(force)
+    def ensure_bridge(self, force: bool = False, takeover: bool = False) -> None:
+        SUPERVISOR.ensure(force, takeover)
 
-    def build_extra_body(self, *, session_id=None, **context):
-        key = context.get("cache_scope_id") or session_id
-        return {SESSION_FIELD: str(key)} if key else {}
+    def bridge_token(self) -> str | None:
+        return SUPERVISOR.token
 
-    def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
-        SUPERVISOR.ensure()
-        key = context.get("cache_scope_id") or context.get("session_id")
-        extra = {SESSION_FIELD: str(key)} if key else {}
+    def _routing(self, key) -> dict:
+        if not key:
+            return {}
+        agent = _calling_agent()
+        if _is_fork(agent):
+            return {SESSION_FIELD: f"fork:{key}:{id(agent):x}", FORK_FIELD: {"parent": str(key)}}
+        extra = {SESSION_FIELD: str(key)}
         origin = _origin()
         if origin:
             extra[ORIGIN_FIELD] = origin
+        return extra
+
+    def build_extra_body(self, *, session_id=None, **context):
+        return self._routing(context.get("cache_scope_id") or session_id)
+
+    def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+        SUPERVISOR.ensure()
+        extra = self._routing(context.get("cache_scope_id") or context.get("session_id"))
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
                 return extra, {"reasoning_effort": "low"}

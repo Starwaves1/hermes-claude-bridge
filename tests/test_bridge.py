@@ -385,36 +385,85 @@ class PluginProfile(unittest.TestCase):
                     sys.modules[k] = v
         self.assertEqual(extra["claude_bridge_origin"], {"platform": "discord", "chat_id": "c1", "user_id": "42"})
 
-    def test_supervisor_starts_bridge_when_port_is_dead(self):
+    def test_fork_requests_get_their_own_key_and_no_origin(self):
+        mod, _ = self._load_plugin()
+        p = mod.claude_cli
+
+        class Agent:
+            session_id = "s1"
+            _memory_write_origin = "background_review"
+            _persist_disabled = True
+
+        def build_api_kwargs(agent):
+            return p.build_api_kwargs_extras(reasoning_config=None, session_id=agent.session_id)
+
+        extra, _ = build_api_kwargs(Agent())
+        self.assertTrue(extra["claude_bridge_session"].startswith("fork:s1:"))
+        self.assertEqual(extra["claude_bridge_fork"], {"parent": "s1"})
+        self.assertNotIn("claude_bridge_origin", extra)
+        Agent._persist_disabled, Agent._memory_write_origin = False, "assistant_tool"
+        self.assertEqual(build_api_kwargs(Agent())[0], {"claude_bridge_session": "s1"})
+
+    def _free_port(self):
         import socket
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
-        over = {"CLAUDE_CLI_BRIDGE_BASE_URL": f"http://127.0.0.1:{port}/v1", "CLAUDE_BRIDGE_AUTOSTART": "1", "CLAUDE_BRIDGE_STATE_DIR": str(TMP / "sup")}
+        return port
+
+    def _with_env(self, over):
         saved = {k: os.environ.get(k) for k in over}
         os.environ.update(over)
-        try:
-            mod, _ = self._load_plugin()  # import itself runs ensure(force=True)
-            sup = mod.SUPERVISOR
-            self.assertIsNotNone(sup.proc)
-            self.assertTrue(sup.up())
-            first = sup.proc
-            sup.ensure(force=True)
-            self.assertIs(sup.proc, first)  # healthy: no second spawn
-            self.assertIn("listening", (TMP / "sup" / "bridge.log").read_text())
-        finally:
+
+        def restore():
             for k, v in saved.items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-            try:
-                mod.SUPERVISOR.proc.terminate()
-                mod.SUPERVISOR.proc.wait(5)
-            except Exception:
-                pass
+        self.addCleanup(restore)
 
+    def test_supervisor_hands_the_token_over_a_pipe_and_replaces_orphans(self):
+        port = self._free_port()
+        state = TMP / f"sup-{port}"
+        self._with_env({"CLAUDE_CLI_BRIDGE_BASE_URL": f"http://127.0.0.1:{port}/v1", "CLAUDE_BRIDGE_AUTOSTART": "1", "CLAUDE_BRIDGE_STATE_DIR": str(state)})
+        mods = []
+
+        def cleanup():
+            for m in mods:
+                try:
+                    m.SUPERVISOR.proc.terminate()
+                    m.SUPERVISOR.proc.wait(5)
+                except Exception:
+                    pass
+        self.addCleanup(cleanup)
+        first, _ = self._load_plugin()  # import runs ensure(force=True)
+        mods.append(first)
+        sup = first.SUPERVISOR
+        self.assertTrue(sup.up())
+        self.assertTrue(sup.authorized())
+        self.assertNotIn(sup.token, json.dumps(dict(os.environ)))
+        pid_info = json.loads((state / "bridge.pid").read_text())
+        self.assertEqual((pid_info["pid"], pid_info["owner"]), (sup.proc.pid, os.getpid()))
+        self.assertNotIn("listening", (state / "bridge.out").read_text() if (state / "bridge.out").exists() else "")  # no double logging
+
+        live_other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(live_other.kill)
+        (state / "bridge.pid").write_text(json.dumps({**pid_info, "owner": live_other.pid}))
+        second, _ = self._load_plugin()  # another Hermes process: no token, owner alive
+        mods.append(second)
+        self.assertIsNone(second.SUPERVISOR.token)
+        self.assertTrue(sup.authorized())  # left alone
+
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (state / "bridge.pid").write_text(json.dumps({**pid_info, "owner": dead.pid}))
+        third, _ = self._load_plugin()  # owner gone: an orphan, replaced
+        mods.append(third)
+        self.assertTrue(third.SUPERVISOR.authorized())
+        self.assertFalse(sup.authorized())
+        self.assertIsNotNone(sup.proc.poll())
 
 if __name__ == "__main__":
     unittest.main()

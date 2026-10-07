@@ -93,9 +93,21 @@ class LoginSession:
                 line = line.replace(s, "•" * 6)
         return line
 
+    def _held(self, buf: str) -> int:
+        """Length of a tail of `buf` that could be the start of a pasted code;
+        it waits for the next batch so a code split across reads is still
+        redacted whole."""
+        keep = 0
+        for s in self.secrets:
+            for k in range(min(len(s) - 1, len(buf)), 0, -1):
+                if buf.endswith(s[:k]):
+                    keep = max(keep, k)
+                    break
+        return keep
+
     def _flush(self, buf: str) -> None:
         out = []
-        for line in clean(buf):
+        for line in clean(self._redact(buf)):
             line = self._redact(line)
             if line in self.sent[-20:]:
                 continue
@@ -139,8 +151,10 @@ class LoginSession:
                 last_data = time.monotonic()
             now = time.monotonic()
             if buf and (now - last_data >= self.batch or now - buf_start >= 3 * self.batch):
-                self._flush(buf)
-                buf = ""
+                keep = self._held(buf)
+                self._flush(buf[: len(buf) - keep])
+                buf = buf[len(buf) - keep:] if keep else ""
+                buf_start = now
             if not r and self.proc.poll() is not None:
                 break
         if buf:

@@ -50,13 +50,18 @@ if opt("pre"):
     sys.stdout.flush()
     got = [sys.stdin.readline() for l in reqs if json.loads(l)["type"] == "control_request"]
     open(f"{{d}}/{{n}}.responses", "w").write("".join(got))
+import uuid
+sid = args[args.index("--session-id") + 1] if "--session-id" in args else args[args.index("--resume") + 1] if "--resume" in args else "none"
+if "--fork-session" in args:
+    sid = str(uuid.uuid4())
+open(f"{{d}}/{{n}}.sid", "w").write(sid)
 rp = f"{{d}}/reply-{{n}}.jsonl"
-sys.stdout.write(open(rp if os.path.exists(rp) else f"{{d}}/reply.jsonl").read())
+sys.stdout.write(open(rp if os.path.exists(rp) else f"{{d}}/reply.jsonl").read().replace("__SID__", sid))
 sys.stdout.flush()
 open(f"{{d}}/{{n}}.replied", "w").write(str(time.time()))
 if opt("post"):
     time.sleep(float(opt("postdelay") or 0))
-    sys.stdout.write(opt("post"))
+    sys.stdout.write(opt("post").replace("__SID__", sid))
     sys.stdout.flush()
     open(f"{{d}}/{{n}}.posted", "w").write(str(time.time()))
 if opt("exit"):
@@ -81,7 +86,9 @@ if a[:2] == ["auth", "login"]:
     sys.stdout.write("\\r\\u280b\\r\\u2819\\rPaste code here if prompted > ")
     sys.stdout.flush()
     code = sys.stdin.readline().strip()
-    sys.stdout.write("\\r\\n" + code + "\\r\\n")
+    import time
+    sys.stdout.write("\\r\\nchecking " + code[:3]); sys.stdout.flush(); time.sleep(0.6)
+    sys.stdout.write(code[3:] + "\\r\\n")
     if code == "GOODCODE#123":
         open(state, "w").write("1")
         print("Login successful.")
@@ -97,10 +104,11 @@ sys.exit(2)
 """)
 FAKE_LOGIN.chmod(0o755)
 
+TOKEN = "test-control-token"
 USAGE = {"input_tokens": 3, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 100, "output_tokens": 20}
 
 
-def turn_events(content="", calls=None, session="s", extra=None, is_error=False, result=None):
+def turn_events(content="", calls=None, session="__SID__", extra=None, is_error=False, result=None):
     structured = {"content": content, "tool_calls": calls or []}
     ev = [
         {"type": "system", "subtype": "init", "model": "claude-fable-5-1", "permissionMode": "auto", "apiKeySource": "none", "session_id": session},
@@ -142,11 +150,15 @@ class Harness(unittest.TestCase):
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="calls-", dir=TMP))
-        self.saved = {k: getattr(cb, k) for k in ("CLAUDE_BIN", "child_env", "STORE", "WORKDIR", "SCRATCH_DIR", "HEARTBEAT_SECONDS")}
+        self.saved = {k: getattr(cb, k) for k in ("CLAUDE_BIN", "child_env", "harness_env", "STORE", "WORKDIR", "SCRATCH_DIR", "HEARTBEAT_SECONDS")}
+        self.saved_token = cb.CONTROL["token"]
+        cb.CONTROL["token"] = TOKEN
         self.saved_help = dict(cb._HELP)
         cb.CLAUDE_BIN = str(FAKE)
         orig_env = self.saved["child_env"]
         cb.child_env = lambda: {**orig_env(), "FAKE_DIR": str(self.dir)}
+        orig_harness = self.saved["harness_env"]
+        cb.harness_env = lambda: {**orig_harness(), "FAKE_DIR": str(self.dir)}
         cb.STORE = cb.SessionStore(self.dir / "sessions.json")
         cb.WORKDIR = self.dir / "workspace"
         cb.SCRATCH_DIR = self.dir / "scratch"
@@ -155,6 +167,7 @@ class Harness(unittest.TestCase):
     def tearDown(self):
         for k, v in self.saved.items():
             setattr(cb, k, v)
+        cb.CONTROL["token"] = self.saved_token
         cb._HELP.clear()
         cb._HELP.update(self.saved_help)
 
@@ -281,24 +294,141 @@ class Harness(unittest.TestCase):
         self.assertIn("--resume", argv)
         self.assertEqual(self.texts(lines[0]), "q2")
 
+    ME = {"platform": "discord", "chat_id": "c1", "user_id": "42"}
+
     def test_rotated_key_after_compression_keeps_the_session(self):
         self.reply(turn_events("Here is the long, detailed plan you asked for."))
-        _, out = self.post(self.body([{"role": "user", "content": "plan it"}], key="sess-a"))
+        _, out = self.post(self.body([{"role": "user", "content": "plan it"}], key="sess-a", claude_bridge_origin=self.ME))
         sid = cb.STORE.get("sess-a")["uuid"]
         hist = [{"role": "user", "content": "[summary of earlier turns]"}, self.as_hermes(out["choices"][0]["message"]), {"role": "user", "content": "next step?"}]
-        self.post(self.body(hist, key="sess-b"))
+        self.post(self.body(hist, key="sess-b", claude_bridge_origin=self.ME))
         argv, lines, _ = self.call(1)
         self.assertEqual(argv[argv.index("--resume") + 1], sid)
         self.assertEqual(self.texts(lines[0]), "next step?")
         self.assertIsNone(cb.STORE.get("sess-a"))
         self.assertEqual(cb.STORE.get("sess-b")["uuid"], sid)
 
-    def test_short_common_reply_is_not_adopted(self):
-        self.reply(turn_events("Done."))
-        _, out = self.post(self.body([{"role": "user", "content": "do it"}], key="sess-a"))
-        hist = [{"role": "user", "content": "other chat"}, self.as_hermes(out["choices"][0]["message"]), {"role": "user", "content": "hi"}]
-        self.post(self.body(hist, key="sess-b"))
+    def test_adoption_never_crosses_people_or_unknown_origins(self):
+        self.reply(turn_events("Here is the long, detailed plan you asked for."))
+        _, out = self.post(self.body([{"role": "user", "content": "plan it"}], key="sess-a", claude_bridge_origin=self.ME))
+        reply = self.as_hermes(out["choices"][0]["message"])
+        hist = [{"role": "user", "content": "plan it"}, reply, {"role": "user", "content": "mine now"}]
+        self.post(self.body(hist, key="sess-x", claude_bridge_origin={**self.ME, "user_id": "77"}))  # someone else, same chat
         self.assertIn("--session-id", self.call(1)[0])
+        self.post(self.body(hist, key="sess-y"))  # origin unknown
+        self.assertIn("--session-id", self.call(2)[0])
+        later = hist + [{"role": "assistant", "content": "a newer reply from somewhere else entirely"}, {"role": "user", "content": "go"}]
+        self.post(self.body(later, key="sess-z", claude_bridge_origin=self.ME))  # match must be the LAST assistant message
+        self.assertIn("--session-id", self.call(3)[0])
+        self.assertIsNotNone(cb.STORE.get("sess-a"))
+
+    def test_one_claude_session_is_never_resumed_twice_at_once(self):
+        self.reply(turn_events("a1"))
+        _, out = self.post(self.body([{"role": "user", "content": "q1"}]))
+        sid = cb.STORE.get("conv-1")["uuid"]
+        hold = cb.STORE.turn_lock("uuid:" + sid)
+        hold.acquire()
+        saved = cb.QUEUE_WAIT
+        cb.QUEUE_WAIT = 0.3
+        try:
+            hist = [{"role": "user", "content": "q1"}, self.as_hermes(out["choices"][0]["message"]), {"role": "user", "content": "q2"}]
+            status, out = self.post(self.body(hist))
+        finally:
+            cb.QUEUE_WAIT = saved
+            hold.release()
+        self.assertEqual(status, 503)
+        self.assertEqual(out["error"]["code"], "session_busy")
+
+    def test_hermes_fork_runs_in_a_fork_and_leaves_the_user_session_alone(self):
+        self.reply(turn_events("Here is the long, detailed plan you asked for."), 0)
+        _, out = self.post(self.body([{"role": "user", "content": "plan it"}]))
+        user = cb.STORE.get("conv-1")
+        review = [{"role": "user", "content": "plan it"}, self.as_hermes(out["choices"][0]["message"]), {"role": "user", "content": "Review the conversation above and update memory."}]
+        self.reply(turn_events("", [{"name": "memory", "arguments": {"x": "likes plans"}}]), 1)
+        fb = self.body(review, key="fork:conv-1:abc", claude_bridge_fork={"parent": "conv-1"}, claude_bridge_origin=self.ME)
+        _, fout = self.post(fb)
+        argv, lines, _ = self.call(1)
+        self.assertEqual(argv[argv.index("--resume") + 1], user["uuid"])
+        self.assertIn("--fork-session", argv)
+        self.assertEqual(self.texts(lines[0]), "Review the conversation above and update memory.")
+        fork_sid = (self.dir / "1.sid").read_text()
+        self.assertEqual(cb.STORE.get("fork:conv-1:abc")["uuid"], fork_sid)
+        self.assertEqual(cb.STORE.get("fork:conv-1:abc")["origin"], {})  # forks never ask the user for approvals
+        after = cb.STORE.get("conv-1")
+        self.assertEqual((after["uuid"], after["last"], after["fed"], after["turns"]), (user["uuid"], user["last"], user["fed"], user["turns"]))
+        call = fout["choices"][0]["message"]["tool_calls"][0]
+        self.reply(turn_events("saved"), 2)
+        fb["messages"] += [self.as_hermes(fout["choices"][0]["message"]), {"role": "tool", "tool_call_id": call["id"], "content": "ok"}]
+        self.post(fb)
+        argv, _, _ = self.call(2)
+        self.assertEqual(argv[argv.index("--resume") + 1], fork_sid)
+        self.assertNotIn("--fork-session", argv)
+
+    def test_long_history_bootstrap_is_capped(self):
+        saved = cb.BOOTSTRAP_MAX_CHARS
+        cb.BOOTSTRAP_MAX_CHARS = 2000
+        try:
+            hist = []
+            for i in range(40):
+                hist += [{"role": "user", "content": f"question {i} " + "x" * 200}, {"role": "assistant", "content": f"answer {i} " + "y" * 200}]
+            self.reply(turn_events("ok"))
+            self.post(self.body(hist + [{"role": "user", "content": "latest"}], key="long"))
+        finally:
+            cb.BOOTSTRAP_MAX_CHARS = saved
+        text = self.texts(self.call(0)[1][0])
+        self.assertLess(len(text), 3000)
+        self.assertIn("older message(s) omitted", text)
+        self.assertIn("answer 39", text)
+        self.assertNotIn("question 0 ", text)
+        self.assertTrue(text.rstrip().endswith("latest"))
+
+    def test_error_after_heartbeat_keeps_its_status_in_the_stream(self):
+        self.reply(turn_events(is_error=True, result="Claude usage limit reached. Your limit will reset at 3pm"))
+        (self.dir / "sleep-0").write_text("1.0")
+        cb.HEARTBEAT_SECONDS = 0.3
+        status, raw = self.post(self.body([{"role": "user", "content": "x"}], stream=True), raw=True)
+        self.assertEqual(status, 200)
+        err = [json.loads(l[6:]) for l in raw.decode().split("\n\n") if l.startswith("data: {\"error\"")][0]["error"]
+        self.assertEqual((err["status"], err["type"], err["code"]), (429, "rate_limit_error", "claude_usage_limit"))
+        self.assertTrue(err["message"].startswith("429 Too Many Requests: Claude usage limit reached"))
+
+    def test_approval_endpoints_need_the_control_token(self):
+        url = f"http://127.0.0.1:{self.port}/v1/approvals?after=0&wait=0"
+        for headers in ({}, {"X-Bridge-Token": "wrong"}):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5)
+            self.assertEqual(cm.exception.code, 401)
+            cm.exception.close()
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/approvals/anything", data=b'{"user_id":"42","text":"y"}', headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 401)
+        cm.exception.close()
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"X-Bridge-Token": TOKEN}), timeout=5) as r:
+            self.assertIn("instance", json.load(r))
+        cb.CONTROL["token"] = ""
+        cb.APPROVALS.last_poll = time.time()
+        self.assertEqual(cb.APPROVALS.ask("z", {"tool_name": "Bash", "input": {}}, self.ME, timeout=1)["message"], "no approval channel")
+
+    def test_child_env_inherits_but_strips_billing_and_control(self):
+        over = {"ANTHROPIC_API_KEY": "sk", "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "x", "CLAUDE_BRIDGE_LOGIN_USERS": "1",
+                "HTTPS_PROXY": "http://proxy:3128", "SSH_AUTH_SOCK": "/tmp/agent.sock", "SSL_CERT_FILE": "/etc/ca.pem", "GH_TOKEN": "gh"}
+        saved = {k: os.environ.get(k) for k in over}
+        os.environ.update(over)
+        try:
+            env = self.saved["harness_env"]()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        for gone in ("ANTHROPIC_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_BRIDGE_LOGIN_USERS"):
+            self.assertNotIn(gone, env)
+        for kept in ("HTTPS_PROXY", "SSH_AUTH_SOCK", "SSL_CERT_FILE", "GH_TOKEN"):
+            self.assertEqual(env[kept], over[kept])
+        self.assertIn(f"{cb.HOME}/.local/bin", env["PATH"].split(":"))
+        self.assertNotIn(TOKEN, json.dumps(env))
 
     def test_missing_claude_session_falls_back_to_a_new_one(self):
         self.reply(turn_events("a1"), 0)
@@ -358,7 +488,14 @@ class Harness(unittest.TestCase):
         status, out = self.post(self.body([{"role": "user", "content": "x"}], stream=True))
         self.assertEqual(status, 401)
         self.assertIn("/login", out["error"]["message"])
-        self.assertIsNone(cb.STORE.get("conv-1"))
+        entry = cb.STORE.get("conv-1")  # recorded at init, before the failure
+        self.assertEqual(entry["last"], "")
+        self.reply(turn_events("hello"))
+        status, out = self.post(self.body([{"role": "user", "content": "x"}]))
+        self.assertEqual(status, 200)
+        argv, lines, _ = self.call(1)
+        self.assertEqual(argv[argv.index("--resume") + 1], entry["uuid"])  # the retry resumes the started session
+        self.assertEqual(self.texts(lines[0]), cb.RESEND_NUDGE)  # and does not deliver "x" a second time
 
     def test_heartbeats_while_claude_works(self):
         self.reply(turn_events("finally"))
@@ -418,7 +555,7 @@ class Harness(unittest.TestCase):
             after = 0
             for text in replies:
                 while True:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/v1/approvals?after={after}&wait=5", timeout=10) as r:
+                    with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/approvals?after={after}&wait=5", headers={"X-Bridge-Token": TOKEN}), timeout=10) as r:
                         data = json.load(r)
                     after = data["seq"]
                     pending = [i for i in data["approvals"] if i["state"] == "pending"]
@@ -426,7 +563,7 @@ class Harness(unittest.TestCase):
                         break
                 item = pending[0]
                 seen.append(item)
-                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/approvals/{item['id']}", data=json.dumps({"user_id": user, "platform": "discord", "text": text}).encode(), headers={"Content-Type": "application/json"})
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/approvals/{item['id']}", data=json.dumps({"user_id": user, "platform": "discord", "text": text}).encode(), headers={"Content-Type": "application/json", "X-Bridge-Token": TOKEN})
                 with urllib.request.urlopen(req, timeout=10) as r:
                     seen.append(json.load(r))
         t = threading.Thread(target=run, daemon=True)
@@ -481,7 +618,7 @@ class Harness(unittest.TestCase):
         self.post(b)
         self.assertEqual(json.loads((self.dir / "1.responses").read_text())["response"]["response"]["message"], "no approval channel")
 
-    def test_background_task_keeps_the_turn_open(self):
+    def test_background_task_detaches_and_follow_up_goes_to_the_chat(self):
         bg = [{"type": "system", "subtype": "task_started", "task_id": "t1", "is_backgrounded": True, "description": "build", "session_id": "s"},
               {"type": "system", "subtype": "task_started", "task_id": "amb", "is_backgrounded": True, "ambient": True, "description": "watcher", "session_id": "s"}]
         self.reply(turn_events("started the build in the background", extra=bg))
@@ -489,10 +626,36 @@ class Harness(unittest.TestCase):
                  {"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "amb", "task_type": "local_bash", "description": "watcher", "ambient": True}], "session_id": "s"}]
         (self.dir / "post-0").write_text("".join(json.dumps(e) + "\n" for e in later) + turn_events("build finished: 0 errors"))
         (self.dir / "postdelay-0").write_text("1.5")
-        status, out = self.post(self.body([{"role": "user", "content": "build it"}]))
+        cb.APPROVALS.last_poll = time.time()
+        t0 = time.time()
+        status, out = self.post(self.origin_body("build it"))
         self.assertEqual(status, 200)
-        self.assertEqual(out["choices"][0]["message"]["content"], "started the build in the background\n\nbuild finished: 0 errors")
-        self.assertGreater(float((self.dir / "0.eof").read_text()), float((self.dir / "0.posted").read_text()))
+        self.assertLess(time.time() - t0, 1.4)  # the reply did not wait for the background task
+        self.assertEqual(out["choices"][0]["message"]["content"], "started the build in the background")
+        notes = []
+        for _ in range(60):
+            notes = [i for i in cb.APPROVALS.poll(0, 0)[1] if i["state"] == "notice" and "0 errors" in i["text"]]
+            if notes and (self.dir / "0.eof").exists():
+                break
+            time.sleep(0.1)
+        self.assertEqual(notes[0]["text"], "[Background follow-up] build finished: 0 errors")
+        self.assertEqual((notes[0]["platform"], notes[0]["chat_id"]), ("discord", "c1"))
+        self.assertTrue((self.dir / "0.eof").exists())  # child closed once the task was done
+
+    def test_next_turn_stops_running_background_work(self):
+        bg = [{"type": "system", "subtype": "task_started", "task_id": "t1", "is_backgrounded": True, "description": "server", "session_id": "s"}]
+        self.reply(turn_events("dev server is up", extra=bg), 0)
+        cb.APPROVALS.last_poll = time.time()
+        _, out = self.post(self.origin_body("start the server"))
+        pid = int((self.dir / "0.pid").read_text())
+        self.reply(turn_events("stopped it"), 1)
+        hist = [{"role": "user", "content": "start the server"}, self.as_hermes(out["choices"][0]["message"]), {"role": "user", "content": "now stop"}]
+        status, out2 = self.post(self.body(hist, claude_bridge_origin={"platform": "discord", "chat_id": "c1", "user_id": "42"}))
+        self.assertEqual(status, 200)
+        self.assertIn("--resume", self.call(1)[0])
+        with self.assertRaises(OSError):
+            os.kill(pid, 0)
+        self.assertTrue(any("was stopped" in i["text"] for i in cb.APPROVALS.poll(0, 0)[1] if i["state"] == "notice"))
 
     def test_models_advertise_a_large_window(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/v1/models") as r:
@@ -501,6 +664,13 @@ class Harness(unittest.TestCase):
 
 class ApprovalRules(unittest.TestCase):
     BASH = {"tool_name": "Bash", "input": {"command": "ls"}}
+
+    def setUp(self):
+        self.saved_token = cb.CONTROL["token"]
+        cb.CONTROL["token"] = TOKEN
+
+    def tearDown(self):
+        cb.CONTROL["token"] = self.saved_token
 
     def test_reply_parsing_is_exact(self):
         for yes in ("y", "yes", " Y ", "YES\n"):
@@ -656,6 +826,10 @@ class LoginRelay(unittest.TestCase):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), cb.Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.mod.BRIDGE = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        self.mod._token = lambda: TOKEN
+        saved_token = cb.CONTROL["token"]
+        cb.CONTROL["token"] = TOKEN
+        self.addCleanup(cb.CONTROL.__setitem__, "token", saved_token)
         loop = asyncio.new_event_loop()
         threading.Thread(target=loop.run_forever, daemon=True).start()
         sent = []
@@ -694,14 +868,126 @@ class LoginRelay(unittest.TestCase):
         t.join(5)
         self.assertEqual(got["d"], {"behavior": "deny", "message": "not today"})
         for _ in range(50):
-            if any(m == "Denied." for _, m in sent):
+            if any(m.endswith("] Denied.") for _, m in sent):
                 break
             time.sleep(0.05)
-        self.assertIn(("c1", "Denied."), sent)
+        self.assertTrue(any(m.endswith("] Denied.") for _, m in sent), sent)
         self.assertIsNone(dispatch("hello", "42"))  # nothing pending: normal message
         stop.set()
         srv.shutdown()
         loop.call_soon_threadsafe(loop.stop)
+
+    def test_split_code_echo_is_still_redacted(self):
+        sent = []
+        s = self.mod.relay.LoginSession([str(FAKE_LOGIN), "auth", "login", "--claudeai"], self.mod.claude_env(), send=sent.append, batch=0.2).start()
+        for _ in range(50):
+            if any("Paste code" in m for m in sent):
+                break
+            time.sleep(0.1)
+        s.write("GOODCODE#123")
+        self.assertTrue(s.wait(10))
+        joined = "\n".join(sent)
+        self.assertIn("••••••", joined)
+        for leak in ("GOO", "DCODE", "#123"):
+            self.assertNotIn(leak, joined)
+
+    def _gateway(self):
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        sent = []
+
+        class Adapter:
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                sent.append((chat_id, content))
+
+        class Plat:
+            value = "discord"
+        plat = Plat()
+        gw = types.SimpleNamespace(adapters={plat: Adapter()}, _adapter_for_source=lambda src: gw.adapters[plat])
+
+        def dispatch(text, uid="42", command=False):
+            src = types.SimpleNamespace(platform=plat, chat_id="c1", user_id=uid, thread_id=None)
+
+            async def go():
+                r = self.mod.on_dispatch(event=types.SimpleNamespace(text=text, source=src), gateway=gw)
+                if command and r is None:
+                    return r, self.mod.command(text.split(maxsplit=1)[1] if " " in text else "")
+                return r, None
+            return asyncio.run_coroutine_threadsafe(go(), loop).result(10)
+        self.mod._GATEWAY.update(gateway=gw, loop=loop, poller=True)
+        return dispatch, sent
+
+    def test_message_after_a_failed_sign_in_is_held_back_once(self):
+        dispatch, sent = self._gateway()
+        dispatch("/login", command=True)
+        for _ in range(50):
+            if any("Paste code" in m for _, m in sent):
+                break
+            time.sleep(0.1)
+        self.assertEqual(dispatch("WRONGCODE")[0], {"action": "skip", "reason": "claude login input"})
+        for _ in range(100):
+            if any("not signed in" in m for _, m in sent):
+                break
+            time.sleep(0.1)
+        self.assertEqual(dispatch("LATECODE99")[0], {"action": "skip", "reason": "claude login ended"})
+        self.assertTrue(any("held back" in m for _, m in sent))
+        self.assertIsNone(dispatch("hello agent")[0])  # only once
+
+    def test_several_open_approvals_need_an_id(self):
+        o = types.SimpleNamespace(platform="discord", chat_id="c1", user_id="42", thread_id="")
+        self.mod.APPROVALS[("discord", "c1")] = [
+            {"id": "a", "short": "3", "user_id": "42", "tool": "Bash"},
+            {"id": "b", "short": "4", "user_id": "42", "tool": "Write"},
+            {"id": "c", "short": "5", "user_id": "77", "tool": "Bash"},
+        ]
+        self.addCleanup(self.mod.APPROVALS.clear)
+        self.assertEqual(self.mod.pick_approval(o, "y"), (None, "y", True))
+        self.assertEqual(self.mod.pick_approval(o, "y 4")[:2], (self.mod.APPROVALS[("discord", "c1")][1], "y"))
+        self.assertEqual(self.mod.pick_approval(o, "3 not on prod")[1], "not on prod")
+        self.assertIsNone(self.mod.pick_approval(o, "n 5")[0])  # someone else's request, and 42 is no admin
+        self.mod.APPROVALS[("discord", "c1")] = [{"id": "a", "short": "3", "user_id": "42", "tool": "Bash"}, {"id": "c", "short": "5", "user_id": "77", "tool": "Bash"}]
+        self.assertEqual(self.mod.pick_approval(o, "3 is fine")[:2], (self.mod.APPROVALS[("discord", "c1")][0], "3 is fine"))  # one own item: bare reply
+
+    def test_command_uses_the_session_context_when_hermes_sets_it(self):
+        dispatch, _ = self._gateway()
+        sc = types.ModuleType("gateway.session_context")
+        env = {"HERMES_SESSION_PLATFORM": "discord", "HERMES_SESSION_CHAT_ID": "c9", "HERMES_SESSION_USER_ID": "43"}
+        sc.get_session_env = lambda name, default="": env.get(name, default)
+        gwmod = types.ModuleType("gateway")
+        gwmod.session_context = sc
+        saved = {k: sys.modules.get(k) for k in ("gateway", "gateway.session_context")}
+        sys.modules["gateway"], sys.modules["gateway.session_context"] = gwmod, sc
+        try:
+            self.assertIn("not enabled for your user id (43)", self.mod.command("status"))
+            env["HERMES_SESSION_USER_ID"] = "42"
+            self.assertIn("signed in", self.mod.command("status"))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_long_messages_are_split_for_chat_limits(self):
+        text = "\n".join(f"line {i} " + "z" * 90 for i in range(60)) + "\n" + "w" * 5000
+        parts = self.mod.chunks(text)
+        self.assertTrue(all(len(p) <= 1900 for p in parts))
+        self.assertEqual("".join(parts).replace("\n", ""), text.replace("\n", ""))
+
+    def test_poller_starts_over_when_the_bridge_restarts(self):
+        calls = []
+        script = [(200, {"instance": "A", "seq": 7, "approvals": []}), (200, {"instance": "B", "seq": 2, "approvals": []}), (200, {"instance": "B", "seq": 2, "approvals": []})]
+        stop = threading.Event()
+
+        def fake(method, path, body=None, timeout=10):
+            calls.append(path)
+            if len(calls) >= len(script):
+                stop.set()
+            return script[min(len(calls), len(script)) - 1]
+        self.mod.bridge_call = fake
+        self.mod.poll_approvals(stop, 0)
+        self.assertEqual(calls[:3], ["/approvals?after=0&wait=0", "/approvals?after=7&wait=0", "/approvals?after=0&wait=0"])
 
     def test_login_is_denied_without_allowlist(self):
         os.environ["CLAUDE_BRIDGE_LOGIN_USERS"] = ""
