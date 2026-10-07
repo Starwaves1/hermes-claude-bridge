@@ -1,9 +1,12 @@
-"""claude-login — `/login` (and `/claude-login`) for the claude-cli bridge.
+"""claude-login — the chat side of the claude-cli bridge.
 
-Runs `claude auth login --claudeai` in a pty inside the Hermes host, posts
-its output to the chat that asked, and feeds that user's next plain message
-(the code) straight to the pty, so the agent never sees it. Restricted to
-the user ids in CLAUDE_BRIDGE_LOGIN_USERS.
+- `/login` (and `/claude-login`) runs `claude auth login --claudeai` in a pty
+  inside the Hermes host, posts its output to the chat that asked, and feeds
+  that user's next plain message (the code) straight to the pty, so the agent
+  never sees it. Restricted to the user ids in CLAUDE_BRIDGE_LOGIN_USERS.
+- Approvals: long-polls the bridge for Claude Code permission requests,
+  posts each to the chat that owns the turn, and takes the owner's (or an
+  admin's) next plain message there as the answer.
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -30,6 +35,10 @@ USAGE = "Usage: /login (start), /login status, /login logout, /login cancel"
 _ORIGIN: contextvars.ContextVar = contextvars.ContextVar("claude_login_origin", default=None)
 _RECENT: Dict[str, Any] = {"origin": None, "ts": 0.0}
 PENDING: Dict[Tuple[str, str, str], relay.LoginSession] = {}
+BRIDGE = os.environ.get("CLAUDE_CLI_BRIDGE_BASE_URL", "http://127.0.0.1:8790/v1").rstrip("/")
+APPROVALS: Dict[Tuple[str, str], list] = {}
+_APPROVAL_LOCK = threading.Lock()
+_GATEWAY: Dict[str, Any] = {"gateway": None, "loop": None, "poller": None}
 
 
 class Origin:
@@ -120,6 +129,105 @@ def sender(o: Origin):
     return send
 
 
+def bridge_call(method: str, path: str, body: Optional[dict] = None, timeout: float = 10) -> Tuple[int, dict]:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BRIDGE + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        with e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except Exception:
+                return e.code, {}
+
+
+def _send_to(platform: str, chat_id: str, thread_id: str, text: str) -> None:
+    gateway, loop = _GATEWAY["gateway"], _GATEWAY["loop"]
+    adapter = None
+    for k, a in (getattr(gateway, "adapters", None) or {}).items():
+        if str(getattr(k, "value", k)) == platform:
+            adapter = a
+    if adapter is None or loop is None:
+        logger.warning("claude-login: no adapter for %s, approval prompt not delivered", platform)
+        return
+    coro = adapter.send(chat_id, text, metadata={"thread_id": thread_id} if thread_id else None)
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        loop.create_task(coro)
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
+    except Exception as exc:
+        logger.warning("claude-login: approval send failed: %s", exc)
+
+
+def poll_approvals(stop: Optional[threading.Event] = None, wait: float = 25) -> None:
+    after = 0
+    while not (stop and stop.is_set()):
+        try:
+            status, data = bridge_call("GET", f"/approvals?after={after}&wait={wait}", timeout=wait + 15)
+        except Exception:
+            time.sleep(3)
+            continue
+        if status != 200:
+            time.sleep(3)
+            continue
+        seq = int(data.get("seq") or 0)
+        if seq < after:  # bridge restarted
+            after = 0
+            continue
+        for item in data.get("approvals") or []:
+            key = (str(item.get("platform")), str(item.get("chat_id")))
+            with _APPROVAL_LOCK:
+                lst = APPROVALS.setdefault(key, [])
+                known = any(i["id"] == item["id"] for i in lst)
+                if item.get("state") == "pending":
+                    if not known:
+                        lst.append(item)
+                else:
+                    lst[:] = [i for i in lst if i["id"] != item["id"]]
+            if item.get("state") == "pending" and not known:
+                _send_to(key[0], key[1], str(item.get("thread_id") or ""), str(item.get("text") or ""))
+            elif item.get("state") == "timeout" and known:
+                _send_to(key[0], key[1], str(item.get("thread_id") or ""), f"No answer in time; Claude Code was told no ({item.get('tool')}).")
+        after = seq
+
+
+def _answer_approval(o: Origin, text: str) -> bool:
+    with _APPROVAL_LOCK:
+        lst = list(APPROVALS.get((o.platform, o.chat_id), []))
+    for item in lst:
+        if o.user_id != str(item.get("user_id")) and not allowed(o):
+            continue
+        try:
+            status, data = bridge_call("POST", f"/approvals/{item['id']}", {"user_id": o.user_id, "platform": o.platform, "text": text}, timeout=5)
+        except Exception:
+            return False
+        if status in (200, 404):
+            with _APPROVAL_LOCK:
+                cur = APPROVALS.get((o.platform, o.chat_id), [])
+                cur[:] = [i for i in cur if i["id"] != item["id"]]
+        if status == 200:
+            if item.get("tool") != "AskUserQuestion":
+                _send_to(o.platform, o.chat_id, o.thread_id, "Allowed." if data.get("decision") == "allow" else "Denied.")
+            return True
+    return False
+
+
+def _capture_gateway(gateway: Any, loop: Optional[asyncio.AbstractEventLoop]) -> None:
+    if gateway is None or loop is None:
+        return
+    _GATEWAY["gateway"], _GATEWAY["loop"] = gateway, loop
+    if _GATEWAY["poller"] is None:
+        _GATEWAY["poller"] = threading.Thread(target=poll_approvals, name="claude-approvals", daemon=True)
+        _GATEWAY["poller"].start()
+
+
 def on_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> Optional[dict]:
     try:
         source = getattr(event, "source", None)
@@ -131,10 +239,13 @@ def on_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> Optional[di
         except RuntimeError:
             loop = None
         o = Origin(source, gateway, loop)
+        _capture_gateway(gateway, loop)
         sess = PENDING.get(o.key)
         if sess is not None and sess.alive() and text and not text.startswith("/"):
             sess.write(text)
             return {"action": "skip", "reason": "claude login input"}
+        if text and not text.startswith("/") and _answer_approval(o, text):
+            return {"action": "skip", "reason": "claude approval answer"}
         if text.startswith("/"):
             head = text[1:].split(maxsplit=1)[0].split("@")[0].lower().replace("_", "-") if len(text) > 1 else ""
             if head in COMMANDS:

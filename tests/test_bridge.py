@@ -367,6 +367,23 @@ class PluginProfile(unittest.TestCase):
         self.assertEqual(extra, {"claude_bridge_session": "root"})  # compression-stable scope wins
         self.assertEqual(top, {"reasoning_effort": "xhigh"})
         self.assertEqual(p.build_api_kwargs_extras(reasoning_config=None), ({}, {}))
+        import types
+        sc = types.ModuleType("gateway.session_context")
+        env = {"HERMES_SESSION_PLATFORM": "discord", "HERMES_SESSION_CHAT_ID": "c1", "HERMES_SESSION_USER_ID": "42", "HERMES_SESSION_THREAD_ID": ""}
+        sc.get_session_env = lambda name, default="": env.get(name, default)
+        gw = types.ModuleType("gateway")
+        gw.session_context = sc
+        saved = {k: sys.modules.get(k) for k in ("gateway", "gateway.session_context")}
+        sys.modules["gateway"], sys.modules["gateway.session_context"] = gw, sc
+        try:
+            extra, _ = p.build_api_kwargs_extras(reasoning_config=None, session_id="s1")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        self.assertEqual(extra["claude_bridge_origin"], {"platform": "discord", "chat_id": "c1", "user_id": "42"})
 
     def test_supervisor_starts_bridge_when_port_is_dead(self):
         import socket

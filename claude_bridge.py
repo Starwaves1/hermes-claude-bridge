@@ -69,6 +69,10 @@ HEARTBEAT_SECONDS = float(os.environ.get("CLAUDE_BRIDGE_HEARTBEAT", "10"))
 PERMISSION_MODE = os.environ.get("CLAUDE_BRIDGE_PERMISSION_MODE", "auto")
 SESSION_TTL = float(os.environ.get("CLAUDE_BRIDGE_SESSION_TTL_DAYS", "30")) * 86400
 ADOPT_WINDOW = 12 * 3600
+APPROVAL_TIMEOUT = float(os.environ.get("CLAUDE_BRIDGE_APPROVAL_TIMEOUT", "600"))
+BG_WAIT = float(os.environ.get("CLAUDE_BRIDGE_BG_WAIT", "600"))
+BG_GRACE = 10.0
+POLL_STALE = 60.0
 FAKE_ERROR = os.environ.get("CLAUDE_BRIDGE_FAKE_ERROR", "")  # test hook: "limit" | "login" | "crash"
 
 # Hermes tools Claude Code already has natively; they are not offered twice.
@@ -81,6 +85,7 @@ DROP_TOOLS = _env_list("CLAUDE_BRIDGE_DROP_TOOLS", DEFAULT_DROP_TOOLS) - _env_li
 
 STRUCTURED_TOOL = "StructuredOutput"
 SESSION_FIELD = "claude_bridge_session"
+ORIGIN_FIELD = "claude_bridge_origin"
 
 MODEL_ALIASES = ("fable", "opus", "sonnet", "haiku")
 MODEL_IDS = (
@@ -554,6 +559,178 @@ def stream_json_line(blocks: List[Dict[str, Any]]) -> str:
     return json.dumps({"type": "user", "message": {"role": "user", "content": blocks}}, ensure_ascii=False) + "\n"
 
 
+# ── approvals (Claude Code permission requests relayed to the chat) ─
+
+
+def _clip(text: str, n: int) -> str:
+    text = " ".join(str(text).split()) if "\n" not in str(text) else str(text).strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def admins() -> Set[str]:
+    return _env_list("CLAUDE_BRIDGE_LOGIN_USERS")
+
+
+def describe_request(req: Dict[str, Any]) -> str:
+    """Chat text for one can_use_tool request."""
+    inp = req.get("input") if isinstance(req.get("input"), dict) else {}
+    tool = str(req.get("display_name") or req.get("tool_name") or "a tool")
+    if req.get("tool_name") == "AskUserQuestion":
+        out = ["Claude Code asks:"]
+        qs = [q for q in inp.get("questions") or [] if isinstance(q, dict)]
+        for n, q in enumerate(qs, 1):
+            head = f"{n}. " if len(qs) > 1 else ""
+            out.append(f"{head}{q.get('question', '')}")
+            for i, o in enumerate(q.get("options") or [], 1):
+                if isinstance(o, dict):
+                    desc = f" — {o.get('description')}" if o.get("description") else ""
+                    out.append(f"   {i}) {o.get('label', '')}{desc}")
+        out.append("Reply with an option number, or type your answer.")
+        return "\n".join(out)
+    detail = ""
+    for k in ("command", "file_path", "notebook_path", "url", "query", "pattern", "path", "prompt"):
+        if inp.get(k):
+            detail = str(inp[k])
+            break
+    if not detail and inp:
+        detail = json.dumps(inp, ensure_ascii=False, separators=(",", ":"))
+    out = [f"Claude Code wants to use {tool}:"]
+    if detail:
+        out.append(_clip(detail, 500))
+    note = req.get("description") or inp.get("description")
+    if note and str(note) != detail:
+        out.append(f"({_clip(note, 200)})")
+    if req.get("blocked_path") and str(req["blocked_path"]) not in detail:
+        out.append(f"Path: {req['blocked_path']}")
+    out.append("Reply y / n, or give a reason to deny.")
+    return "\n".join(out)
+
+
+def decide(req: Dict[str, Any], reply: str) -> Dict[str, Any]:
+    """Control-protocol decision for a user's chat reply (exact match after strip + lowercase)."""
+    inp = req.get("input") if isinstance(req.get("input"), dict) else {}
+    text = (reply or "").strip()
+    if req.get("tool_name") == "AskUserQuestion":
+        qs = [q for q in inp.get("questions") or [] if isinstance(q, dict)]
+        answers: Dict[str, Any] = {}
+        for q in qs:
+            value: Any = text
+            opts = [o for o in q.get("options") or [] if isinstance(o, dict)]
+            if len(qs) == 1 and re.fullmatch(r"\d+(\s*,\s*\d+)*", text):
+                picked = [opts[int(i) - 1]["label"] for i in re.findall(r"\d+", text) if 0 < int(i) <= len(opts)]
+                if picked:
+                    value = ", ".join(picked)
+            answers[str(q.get("question", ""))] = value
+        return {"behavior": "allow", "updatedInput": {**inp, "answers": answers}}
+    low = text.lower()
+    if low in ("y", "yes"):
+        return {"behavior": "allow", "updatedInput": inp}
+    if low in ("n", "no"):
+        return {"behavior": "deny", "message": "The user denied this action."}
+    return {"behavior": "deny", "message": text}
+
+
+def deny(message: str) -> Dict[str, Any]:
+    return {"behavior": "deny", "message": message}
+
+
+class Approvals:
+    """Pending permission requests, long-polled by the Hermes plugin and
+    answered by the person who owns the turn (or a login admin)."""
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.items: Dict[str, Dict[str, Any]] = {}
+        self.seq = 0
+        self.last_poll = 0.0
+        self.polling = 0
+
+    def _set(self, item: Dict[str, Any], state: str) -> None:
+        self.seq += 1
+        item["seq"], item["state"], item["closed"] = self.seq, state, (time.time() if state != "pending" else None)
+        self.cond.notify_all()
+
+    def channel_alive(self) -> bool:
+        return self.polling > 0 or time.time() - self.last_poll < POLL_STALE
+
+    def ask(self, rid: str, req: Dict[str, Any], origin: Dict[str, Any], timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        tool = str(req.get("tool_name") or "?")
+        if not (origin.get("platform") and origin.get("chat_id")) or not self.channel_alive():
+            log.info("approval %s -> deny (no approval channel)", tool)
+            if tool == "AskUserQuestion":
+                return deny("no approval channel: nobody can answer here. Ask the question in your reply instead.")
+            return deny("no approval channel")
+        item = {
+            "id": rid, "tool": tool, "req": req, "text": describe_request(req), "answer": None,
+            "platform": str(origin.get("platform") or ""), "chat_id": str(origin.get("chat_id") or ""),
+            "thread_id": str(origin.get("thread_id") or ""), "user_id": str(origin.get("user_id") or ""),
+        }
+        end = time.monotonic() + (APPROVAL_TIMEOUT if timeout is None else timeout)
+        with self.cond:
+            self.items[rid] = item
+            self._set(item, "pending")
+            while item["state"] == "pending":
+                left = end - time.monotonic()
+                if left <= 0:
+                    self._set(item, "timeout")
+                    break
+                self.cond.wait(min(left, 5.0))
+            state = item["state"]
+            self._prune()
+        if state == "cancelled":
+            log.info("approval %s -> cancelled by claude", tool)
+            return None
+        if state == "timeout":
+            log.info("approval %s -> deny (timeout)", tool)
+            return deny("no answer from user")
+        decision = decide(req, item["answer"])
+        log.info("approval %s -> %s", tool, decision["behavior"])
+        return decision
+
+    def answer(self, rid: str, user_id: str, platform: str, text: str) -> Tuple[int, Dict[str, Any]]:
+        with self.cond:
+            item = self.items.get(rid)
+            if not item or item["state"] != "pending":
+                return 404, {"ok": False, "error": "no pending approval with that id"}
+            uid = str(user_id or "")
+            if not uid or (uid != item["user_id"] and uid not in admins() and f"{platform}:{uid}" not in admins()):
+                return 403, {"ok": False, "error": "only the person who sent this turn (or an admin) can answer"}
+            item["answer"] = text
+            self._set(item, "answered")
+            return 200, {"ok": True, "decision": decide(item["req"], text)["behavior"]}
+
+    def cancel(self, rid: str) -> None:
+        with self.cond:
+            item = self.items.get(rid)
+            if item and item["state"] == "pending":
+                self._set(item, "cancelled")
+
+    def poll(self, after: int, wait: float) -> Tuple[int, List[Dict[str, Any]]]:
+        keys = ("id", "seq", "state", "tool", "text", "platform", "chat_id", "thread_id", "user_id")
+        end = time.monotonic() + max(0.0, min(wait, 60.0))
+        with self.cond:
+            self.polling += 1
+            try:
+                while True:
+                    out = [{k: i[k] for k in keys} for i in self.items.values() if i["seq"] > after]
+                    left = end - time.monotonic()
+                    if out or left <= 0:
+                        break
+                    self.cond.wait(left)
+            finally:
+                self.polling -= 1
+                self.last_poll = time.time()
+            return self.seq, sorted(out, key=lambda i: i["seq"])
+
+    def _prune(self) -> None:
+        now = time.time()
+        for k in [k for k, i in self.items.items() if i.get("closed") and now - i["closed"] > 900]:
+            del self.items[k]
+
+
+APPROVALS = Approvals()
+
+
 # ── claude subprocess ───────────────────────────────────────────────
 
 
@@ -608,6 +785,7 @@ class ClaudeRun:
     def __init__(self) -> None:
         self.result_text: str = ""
         self.structured: Any = None
+        self.results: List[Tuple[str, Any]] = []         # (result, structured_output) of every turn in the spawn
         self.saw_result: bool = False
         self.is_error: bool = False
         self.subtype: str = ""
@@ -623,6 +801,9 @@ class ClaudeRun:
         self.misrouted: List[str] = []                     # Hermes tools the model tried to call natively
         self.unknown_tool_errors: int = 0
         self.permission_denials: int = 0
+        self.approvals: int = 0
+        self.background: Set[str] = set()                  # live non-ambient background task ids
+        self.waited_background: bool = False
         self.text_streamed: str = ""
         self.final_text: str = ""
 
@@ -673,15 +854,21 @@ def spawn_claude(
     on_text: Optional[Callable[[str], None]] = None,
     on_tick: Optional[Callable[[], None]] = None,
     on_event: Optional[Callable[[str], None]] = None,
+    on_permission: Optional[Callable[[str, Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    on_cancel: Optional[Callable[[str], None]] = None,
 ) -> ClaudeRun:
     """Run one `claude -p` and consume its stream-json events.
 
     on_text(delta) gets text deltas; on_tick() runs on every event and at
     least once a second (it may raise ClientGone to abort the child);
-    on_event(raw_line) sees every stdout line.
+    on_event(raw_line) sees every stdout line. With on_permission, stdin
+    stays open as the control channel: each can_use_tool request is answered
+    by on_permission(request_id, request) on a worker thread, and stdin is
+    closed after a result once no background task is left running.
     """
     _fake_error()
     hermes_names = hermes_names or set()
+    keep_open = on_permission is not None
     cwd.mkdir(parents=True, exist_ok=True)
     run = ClaudeRun()
     try:
@@ -702,14 +889,53 @@ def spawn_claude(
     lines: "queue.Queue[Optional[str]]" = queue.Queue()
     stderr_buf: List[str] = []
     other_lines: List[str] = []
+    stdin_lock = threading.Lock()
+    stdin_state = {"closed": False}
+    open_requests: Set[str] = set()
+
+    def send(obj: Dict[str, Any]) -> None:
+        with stdin_lock:
+            if stdin_state["closed"]:
+                return
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+    def close_stdin() -> None:
+        with stdin_lock:
+            if not stdin_state["closed"]:
+                stdin_state["closed"] = True
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
 
     def feed() -> None:
+        with stdin_lock:
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(stdin_text)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        if not keep_open:
+            close_stdin()
+
+    def answer(rid: str, req: Dict[str, Any]) -> None:
         try:
-            assert proc.stdin is not None
-            proc.stdin.write(stdin_text)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
+            decision = on_permission(rid, req) if on_permission else None
+            if decision is None:  # cancelled by claude: it no longer wants a response
+                return
+            resp: Dict[str, Any] = {"subtype": "success", "request_id": rid, "response": decision}
+        except Exception as exc:
+            resp = {"subtype": "error", "request_id": rid, "error": str(exc)}
+        finally:
+            open_requests.discard(rid)
+        send({"type": "control_response", "response": resp})
 
     def read_out() -> None:
         try:
@@ -731,6 +957,18 @@ def spawn_claude(
         threading.Thread(target=target, daemon=True).start()
 
     deadline = time.monotonic() + SPAWN_TIMEOUT
+    idle = {"since": None, "first_result": None, "bg_was_live": False}
+
+    def maybe_close(now: float) -> None:
+        if not keep_open or stdin_state["closed"] or idle["since"] is None:
+            return
+        if run.background and now - idle["first_result"] < BG_WAIT:
+            idle["bg_was_live"] = run.waited_background = True
+            return
+        if idle["bg_was_live"] and not run.background and now - idle["since"] < BG_GRACE:
+            return  # a finished background task usually triggers one more turn
+        close_stdin()
+
     cur_text = ""
     seen_ids: Set[str] = set()
     finished = False
@@ -739,8 +977,15 @@ def spawn_claude(
             try:
                 line = lines.get(timeout=1.0)
             except queue.Empty:
-                if time.monotonic() > deadline:
+                now = time.monotonic()
+                if now > deadline:
+                    if run.saw_result and keep_open and not stdin_state["closed"]:
+                        log.warning("background work still running at the %ds limit; ending the spawn", int(SPAWN_TIMEOUT))
+                        close_stdin()
+                        deadline = now + 30
+                        continue
                     raise BridgeError(504, f"claude -p exceeded {int(SPAWN_TIMEOUT)}s", code="claude_timeout", etype="timeout_error")
+                maybe_close(now)
                 if on_tick:
                     on_tick()
                 continue
@@ -761,8 +1006,35 @@ def spawn_claude(
                 other_lines.append(stripped)
                 continue
             etype = ev.get("type")
+            if etype == "control_request":
+                rid = str(ev.get("request_id") or "")
+                req = ev.get("request") or {}
+                if req.get("subtype") == "can_use_tool" and on_permission:
+                    run.approvals += 1
+                    open_requests.add(rid)
+                    threading.Thread(target=answer, args=(rid, req), daemon=True).start()
+                else:
+                    send({"type": "control_response", "response": {"subtype": "error", "request_id": rid, "error": f"unsupported control request: {req.get('subtype')}"}})
+                continue
+            if etype == "control_cancel_request":
+                rid = str(ev.get("request_id") or "")
+                if on_cancel and rid in open_requests:
+                    on_cancel(rid)
+                continue
+            if etype == "system" and ev.get("subtype") in ("task_started", "task_notification", "background_tasks_changed"):
+                st = ev.get("subtype")
+                if st == "background_tasks_changed":
+                    run.background = {str(t.get("task_id")) for t in ev.get("tasks") or [] if isinstance(t, dict) and not t.get("ambient")}
+                elif st == "task_started" and ev.get("is_backgrounded") and not ev.get("ambient"):
+                    run.background.add(str(ev.get("task_id")))
+                elif st == "task_notification":
+                    run.background.discard(str(ev.get("task_id")))
+                maybe_close(time.monotonic())
+                continue
             if ev.get("parent_tool_use_id") and etype in ("stream_event", "assistant", "user"):
                 continue  # subagent traffic: not the main thread's context or reply
+            if etype in ("stream_event", "assistant") and idle["since"] is not None:
+                idle["since"], idle["bg_was_live"] = None, False  # a new turn (e.g. a task notification) started
             if etype == "system":
                 if ev.get("subtype") == "init":
                     if ev.get("model"):
@@ -816,25 +1088,37 @@ def spawn_claude(
                 run.saw_result = True
                 run.result_text = str(ev.get("result") or "")
                 run.structured = ev.get("structured_output")
+                run.results.append((run.result_text, run.structured))
                 run.is_error = bool(ev.get("is_error"))
                 run.subtype = str(ev.get("subtype") or "")
                 run.session_id = str(ev.get("session_id") or run.session_id)
-                run.permission_denials = len(ev.get("permission_denials") or [])
+                run.permission_denials += len(ev.get("permission_denials") or [])
                 try:
-                    run.num_turns = int(ev.get("num_turns") or 0)
+                    run.num_turns += int(ev.get("num_turns") or 0)
                 except Exception:
-                    run.num_turns = 0
+                    pass
                 if isinstance(ev.get("usage"), dict):
                     run.usage_total = ev["usage"]
                 mu = ev.get("modelUsage")
                 if isinstance(mu, dict) and mu:
                     run.model_ids = list(mu.keys())
+                now = time.monotonic()
+                idle["since"] = now
+                if idle["first_result"] is None:
+                    idle["first_result"] = now
+                if run.is_error:
+                    close_stdin()
+                maybe_close(now)
         finished = True
     finally:
+        for rid in list(open_requests):
+            if on_cancel:
+                on_cancel(rid)
         if not finished:
             _terminate(proc)
             _close_pipes(proc)
 
+    close_stdin()
     try:
         proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
@@ -901,7 +1185,7 @@ def harness_cmd(model: str, effort: str, sys_path: str, session_uuid: str, resum
         "--verbose",
         "--include-partial-messages",
         "--permission-mode", PERMISSION_MODE,
-        "--permission-prompts", "none",
+        "--permission-prompt-tool", "stdio",
         "--model", model,
         "--effort", effort,
         "--append-system-prompt-file", sys_path,
@@ -949,6 +1233,7 @@ def harness_turn(
     t = Turn()
     t.key, t.dropped, t.offered = session_key(body, system_text, rest), dropped, len(offered)
     call_names = {str(c.get("id")): str((c.get("function") or {}).get("name") or "") for m in rest for c in (m.get("tool_calls") or []) if isinstance(c, dict)}
+    origin = body.get(ORIGIN_FIELD) if isinstance(body.get(ORIGIN_FIELD), dict) else {}
 
     lock = store.turn_lock(t.key)
     if not lock.acquire(timeout=QUEUE_WAIT):
@@ -980,7 +1265,8 @@ def harness_turn(
             dump(f"{t.session[:8]}-{int(time.time())}-turn.jsonl", stdin_text)
             try:
                 with _slot():
-                    t.run = spawn_claude(harness_cmd(model, effort, sys_path, t.session, t.resumed, snapshot_off), stdin_text, WORKDIR, hermes_names=names, on_tick=on_tick, on_event=on_event)
+                    t.run = spawn_claude(harness_cmd(model, effort, sys_path, t.session, t.resumed, snapshot_off), stdin_text, WORKDIR, hermes_names=names, on_tick=on_tick, on_event=on_event,
+                                         on_permission=lambda rid, req: APPROVALS.ask(rid, req, origin), on_cancel=APPROVALS.cancel)
                 break
             except BridgeError as err:
                 if err.code == "claude_session_missing" and t.resumed and attempt == 0:
@@ -1033,6 +1319,16 @@ def run_to_message(run: ClaudeRun, mode: str) -> Tuple[str, List[Dict[str, Any]]
         except Exception:
             structured = None
     result = run.result_text
+    if mode == "tools" and len(run.results) > 1:
+        texts, calls = [], []
+        for res, st in run.results:
+            one = ClaudeRun()
+            one.result_text, one.structured = res, st
+            c, tc = run_to_message(one, "tools")
+            if c:
+                texts.append(c)
+            calls += tc
+        return "\n\n".join(texts), calls
     if mode == "tools":
         if not isinstance(structured, dict) and result:
             try:
@@ -1151,6 +1447,14 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/v1/models", "/models"):
             return self._json(200, models_payload())
+        if path == "/v1/approvals":
+            q = dict(x.split("=", 1) for x in (self.path.split("?", 1)[1] if "?" in self.path else "").split("&") if "=" in x)
+            try:
+                after, wait = int(q.get("after", "0")), float(q.get("wait", "0"))
+            except ValueError:
+                return self._error(BridgeError(400, "after and wait must be numbers", code="bad_request", etype="invalid_request_error"))
+            seq, items = APPROVALS.poll(after, wait)
+            return self._json(200, {"seq": seq, "approvals": items})
         if path == "/health":
             return self._json(200, {
                 "ok": True, "version": __version__, "claude_bin": CLAUDE_BIN, "claude_version": SERVER_STATE.get("claude_version"),
@@ -1160,6 +1464,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path.startswith("/v1/approvals/"):
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except Exception as exc:
+                return self._error(BridgeError(400, f"bad JSON body: {exc}", code="bad_request", etype="invalid_request_error"))
+            status, out = APPROVALS.answer(path.rsplit("/", 1)[1], str(body.get("user_id") or ""), str(body.get("platform") or ""), str(body.get("text") or ""))
+            return self._json(status, out)
         if path not in ("/v1/chat/completions", "/chat/completions"):
             return self._error(BridgeError(404, f"no route {path}", code="not_found"))
         req_id = uuid.uuid4().hex[:8]
@@ -1267,8 +1578,12 @@ class Handler(BaseHTTPRequestHandler):
         where = ""
         if turn:
             where = f" key={turn.key[:24]} session={turn.session[:8]}{' resume' if turn.resumed else ' new'} delta={turn.delta} hermes_tools={turn.offered} native={len(run.native_tools)}"
+            if run.approvals:
+                where += f" asked={run.approvals}"
             if run.permission_denials:
                 where += f" denied={run.permission_denials}"
+            if run.waited_background:
+                where += " waited_bg"
         log.info(
             "req=%s model=%s(%s) effort=%s(%s) mode=%s msgs=%d stream=%d%s -> 200 %s calls=%d turns=%d in=%d cached=%d out=%d %.1fs%s",
             req_id, model, actual_model, effort, effort_src, mode, n_msgs, int(stream), where, finish,

@@ -31,9 +31,9 @@ Code's tools were off, is in the git history.
 | --- | --- |
 | `claude_bridge.py` | OpenAI-compatible server on `127.0.0.1:8790`. Stdlib only, Python 3.9+. |
 | `plugin/claude-cli/` | Hermes model-provider plugin `claude-cli`: tags each request with its conversation, forwards `/model` and `/effort`, starts the bridge if nothing answers on the port. |
-| `plugin/claude-login/` | Hermes plugin: `/login` (and `/claude-login`) signs Claude Code in from chat. |
+| `plugin/claude-login/` | Hermes plugin: `/login` (and `/claude-login`) signs Claude Code in from chat, and relays Claude Code's permission requests to the chat. |
 | `launchd/` | Optional macOS LaunchAgent template. |
-| `tests/` | 38 tests against fake `claude` scripts. No usage spent. |
+| `tests/` | 48 tests against fake `claude` scripts. No usage spent. |
 
 ## How it works
 
@@ -47,7 +47,7 @@ Code's tools were off, is in the git history.
 3. Each turn is one spawn:
    ```
    claude -p --input-format stream-json --output-format stream-json --verbose \
-     --include-partial-messages --permission-mode auto --permission-prompts none \
+     --include-partial-messages --permission-mode auto --permission-prompt-tool stdio \
      --model <m> --effort <e> --append-system-prompt-file <hermes prompt + tool list> \
      --json-schema <reply contract> (--session-id <uuid> | --resume <uuid>)
    ```
@@ -59,7 +59,29 @@ Code's tools were off, is in the git history.
    not offered.
 4. Requests without tools (titles, summaries) run stateless with everything
    off (`--safe-mode --tools ""`).
-5. Streamed replies get an empty keep-alive chunk every 10 s, so long turns
+5. Approvals: auto mode decides most actions itself. Whatever it would ask
+   a person about (ask rules, protected paths, `AskUserQuestion`, connector
+   tools that require approval, repeated classifier blocks) arrives on the
+   control channel and is posted to the chat that sent the turn:
+   ```
+   Claude Code wants to use Bash:
+   rm -rf build/
+   (Remove build output)
+   Reply y / n, or give a reason to deny.
+   ```
+   `y`/`yes` allows, `n`/`no` denies, anything else denies with your text as
+   the reason Claude sees (exact match after trim + lowercase). Questions take
+   an option number or free text. Only the person who sent the turn, or a
+   `CLAUDE_BRIDGE_LOGIN_USERS` admin, can answer; the answer never reaches the
+   agent. No answer in 10 minutes, or no chat to ask (CLI, cron before any
+   message): denied.
+6. Background work: a turn that leaves background tasks running (a
+   `run_in_background` command, a background agent) stays open until they
+   finish, up to `CLAUDE_BRIDGE_BG_WAIT`, and the follow-up Claude writes
+   when they finish is appended to the reply. Hermes waits that long for the
+   reply. Past the limit the reply goes out and Claude Code stops leftover
+   background shells.
+7. Streamed replies get an empty keep-alive chunk every 10 s, so long turns
    do not trip Hermes's stale-stream timer. Usage limit: HTTP 429. Not logged
    in: 401 "run /login". No fallback model on purpose.
 
@@ -113,6 +135,7 @@ in chat:
   normal message. That message goes straight to Claude Code; the agent never
   sees it. Only user ids in `CLAUDE_BRIDGE_LOGIN_USERS` may use it.
 - `/login status`, `/login logout`, `/login cancel`.
+- Approval prompts appear in the chat during a turn; reply as above.
 
 Newer Hermes versions have a built-in `/login` (Nous account); use
 `/claude-login` there.
@@ -136,7 +159,9 @@ terminal works anywhere.
 | `CLAUDE_BRIDGE_CONTEXT_LENGTH` | 1000000 | what `/v1/models` advertises; Claude Code compacts itself |
 | `CLAUDE_BRIDGE_HEARTBEAT` | 10 | seconds of silence before a keep-alive chunk |
 | `CLAUDE_BRIDGE_AUTOSTART` | 1 | the provider plugin starts the bridge when its port is dead |
-| `CLAUDE_BRIDGE_LOGIN_USERS` | empty (deny all) | user ids allowed to run `/login` |
+| `CLAUDE_BRIDGE_LOGIN_USERS` | empty (deny all) | user ids allowed to run `/login` and to answer any approval |
+| `CLAUDE_BRIDGE_APPROVAL_TIMEOUT` | 600 | seconds to wait for an approval before denying |
+| `CLAUDE_BRIDGE_BG_WAIT` | 600 | seconds a turn waits for its background tasks |
 | `CLAUDE_BRIDGE_DUMP_DIR` | off | writes full request content, debugging only |
 | `CLAUDE_BRIDGE_FAKE_ERROR` | off | `limit`, `login` or `crash` to test error paths |
 
@@ -144,8 +169,11 @@ terminal works anywhere.
 
 - `--bare` disables the subscription login and bills an API key. Never add it.
 - On macOS the keychain login needs `USER` in the child environment.
-- Auto mode means Claude Code acts without asking. It runs as the Hermes
-  user, inside the container. Anything that would prompt is denied.
+- Auto mode means Claude Code acts without asking for most things. It runs
+  as the Hermes user, inside the container. A classifier block is reported
+  to Claude, not to you; only actions that would prompt a person reach chat.
+- Host approvals need `--permission-prompt-tool stdio`: without it `-p`
+  denies every prompt silently.
 - Claude Code records the system prompt at a session's first turn. When
   Hermes's prompt changes, the bridge passes `--system-prompt-snapshot off`
   for that session from then on.

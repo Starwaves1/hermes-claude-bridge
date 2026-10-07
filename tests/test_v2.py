@@ -29,22 +29,40 @@ import claude_bridge as cb  # noqa: E402
 
 FAKE = TMP / "fake-claude.py"
 FAKE.write_text(f"""#!{sys.executable}
-import os, sys, time
+import json, os, sys, time
 d = os.environ["FAKE_DIR"]
 n = len([f for f in os.listdir(d) if f.endswith(".args")])
 args = sys.argv[1:]
 open(f"{{d}}/{{n}}.args", "w").write("\\n".join(args))
 if "--append-system-prompt-file" in args:
     open(f"{{d}}/{{n}}.append", "w").write(open(args[args.index("--append-system-prompt-file") + 1]).read())
-open(f"{{d}}/{{n}}.stdin", "w").write(sys.stdin.read())
+open(f"{{d}}/{{n}}.stdin", "w").write(sys.stdin.readline())
 open(f"{{d}}/{{n}}.pid", "w").write(str(os.getpid()))
-if os.path.exists(f"{{d}}/sleep-{{n}}"):
-    time.sleep(float(open(f"{{d}}/sleep-{{n}}").read()))
+def opt(name):
+    p = f"{{d}}/{{name}}-{{n}}"
+    return open(p).read() if os.path.exists(p) else None
+if opt("sleep"):
+    time.sleep(float(opt("sleep")))
+if opt("pre"):
+    reqs = [l for l in opt("pre").splitlines() if l.strip()]
+    for l in reqs:
+        sys.stdout.write(l + "\\n")
+    sys.stdout.flush()
+    got = [sys.stdin.readline() for l in reqs if json.loads(l)["type"] == "control_request"]
+    open(f"{{d}}/{{n}}.responses", "w").write("".join(got))
 rp = f"{{d}}/reply-{{n}}.jsonl"
 sys.stdout.write(open(rp if os.path.exists(rp) else f"{{d}}/reply.jsonl").read())
 sys.stdout.flush()
-ep = f"{{d}}/exit-{{n}}"
-sys.exit(int(open(ep).read()) if os.path.exists(ep) else 0)
+open(f"{{d}}/{{n}}.replied", "w").write(str(time.time()))
+if opt("post"):
+    time.sleep(float(opt("postdelay") or 0))
+    sys.stdout.write(opt("post"))
+    sys.stdout.flush()
+    open(f"{{d}}/{{n}}.posted", "w").write(str(time.time()))
+if opt("exit"):
+    sys.exit(int(opt("exit")))
+sys.stdin.read()
+open(f"{{d}}/{{n}}.eof", "w").write(str(time.time()))
 """)
 FAKE.chmod(0o755)
 
@@ -183,9 +201,9 @@ class Harness(unittest.TestCase):
         argv, lines, append = self.call(0)
         sid = argv[argv.index("--session-id") + 1]
         self.assertNotIn("--resume", argv)
-        for flag, val in (("--input-format", "stream-json"), ("--output-format", "stream-json"), ("--permission-mode", "auto"), ("--permission-prompts", "none"), ("--model", "fable")):
+        for flag, val in (("--input-format", "stream-json"), ("--output-format", "stream-json"), ("--permission-mode", "auto"), ("--permission-prompt-tool", "stdio"), ("--model", "fable")):
             self.assertEqual(argv[argv.index(flag) + 1], val)
-        for banned in ("--safe-mode", "--strict-mcp-config", "--tools", "--bare", "--setting-sources", "--no-session-persistence", "--system-prompt-file"):
+        for banned in ("--safe-mode", "--strict-mcp-config", "--tools", "--disallowedTools", "--bare", "--setting-sources", "--no-session-persistence", "--system-prompt-file", "--permission-prompts", "--max-turns"):
             self.assertNotIn(banned, argv)
         self.assertIn("--json-schema", argv)
         self.assertIn("--include-partial-messages", argv)
@@ -387,9 +405,153 @@ class Harness(unittest.TestCase):
         self.post(b)
         self.assertIn("--resume", self.call(1)[0])
 
+    # -- approvals --------------------------------------------------------
+
+    def control(self, rid, tool, inp, **extra):
+        return json.dumps({"type": "control_request", "request_id": rid, "request": {"subtype": "can_use_tool", "tool_name": tool, "display_name": tool, "input": inp, "tool_use_id": "toolu_" + rid, **extra}})
+
+    def answer_when_asked(self, replies, user="42"):
+        """Play the Hermes plugin: long-poll the bridge and answer each prompt."""
+        seen = []
+
+        def run():
+            after = 0
+            for text in replies:
+                while True:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/v1/approvals?after={after}&wait=5", timeout=10) as r:
+                        data = json.load(r)
+                    after = data["seq"]
+                    pending = [i for i in data["approvals"] if i["state"] == "pending"]
+                    if pending:
+                        break
+                item = pending[0]
+                seen.append(item)
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/approvals/{item['id']}", data=json.dumps({"user_id": user, "platform": "discord", "text": text}).encode(), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    seen.append(json.load(r))
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t, seen
+
+    def origin_body(self, text, **kw):
+        return self.body([{"role": "user", "content": text}], claude_bridge_origin={"platform": "discord", "chat_id": "c1", "user_id": "42"}, **kw)
+
+    def test_permission_request_relayed_and_answered(self):
+        cmd = {"command": "rm -rf build/", "description": "Remove build output"}
+        (self.dir / "pre-0").write_text(self.control("r1", "Bash", cmd) + "\n" + self.control("r2", "Write", {"file_path": "/etc/hosts", "content": "x"}) + "\n")
+        self.reply(turn_events("cleaned up"))
+        cb.APPROVALS.last_poll = time.time()
+        t, seen = self.answer_when_asked(["y", "use /tmp instead"])
+        status, out = self.post(self.origin_body("clean the build"))
+        t.join(10)
+        self.assertEqual(status, 200)
+        self.assertIn("Claude Code wants to use Bash:\nrm -rf build/\n(Remove build output)\nReply y / n, or give a reason to deny.", seen[0]["text"])
+        self.assertEqual((seen[0]["platform"], seen[0]["chat_id"], seen[0]["user_id"]), ("discord", "c1", "42"))
+        self.assertEqual(seen[1], {"ok": True, "decision": "allow"})
+        self.assertIn("/etc/hosts", seen[2]["text"])
+        responses = [json.loads(l)["response"] for l in (self.dir / "0.responses").read_text().splitlines()]
+        self.assertEqual(responses[0], {"subtype": "success", "request_id": "r1", "response": {"behavior": "allow", "updatedInput": cmd}})
+        self.assertEqual(responses[1]["response"], {"behavior": "deny", "message": "use /tmp instead"})
+        self.assertTrue((self.dir / "0.eof").exists())  # stdin closed after the result
+
+    def test_question_relayed_and_answered(self):
+        q = {"questions": [{"question": "Which color?", "header": "Color", "options": [{"label": "Red", "description": "warm"}, {"label": "Blue", "description": "cool"}], "multiSelect": False}]}
+        (self.dir / "pre-0").write_text(self.control("q1", "AskUserQuestion", q, requires_user_interaction=True) + "\n")
+        self.reply(turn_events("blue it is"))
+        cb.APPROVALS.last_poll = time.time()
+        t, seen = self.answer_when_asked(["2"])
+        status, _ = self.post(self.origin_body("pick a color"))
+        t.join(10)
+        self.assertEqual(status, 200)
+        self.assertIn("Which color?\n   1) Red — warm\n   2) Blue — cool", seen[0]["text"])
+        resp = json.loads((self.dir / "0.responses").read_text())["response"]["response"]
+        self.assertEqual(resp, {"behavior": "allow", "updatedInput": {**q, "answers": {"Which color?": "Blue"}}})
+
+    def test_no_approval_channel_denies_at_once(self):
+        (self.dir / "pre-0").write_text(self.control("r1", "Bash", {"command": "make"}) + "\n")
+        self.reply(turn_events("could not build"))
+        cb.APPROVALS.last_poll = 0.0
+        status, _ = self.post(self.origin_body("build"))
+        self.assertEqual(status, 200)
+        resp = json.loads((self.dir / "0.responses").read_text())["response"]["response"]
+        self.assertEqual(resp, {"behavior": "deny", "message": "no approval channel"})
+        cb.APPROVALS.last_poll = time.time()
+        b = self.body([{"role": "user", "content": "cli turn"}], key="cli")  # no origin: CLI or cron
+        (self.dir / "pre-1").write_text(self.control("r2", "Bash", {"command": "make"}) + "\n")
+        self.post(b)
+        self.assertEqual(json.loads((self.dir / "1.responses").read_text())["response"]["response"]["message"], "no approval channel")
+
+    def test_background_task_keeps_the_turn_open(self):
+        bg = [{"type": "system", "subtype": "task_started", "task_id": "t1", "is_backgrounded": True, "description": "build", "session_id": "s"},
+              {"type": "system", "subtype": "task_started", "task_id": "amb", "is_backgrounded": True, "ambient": True, "description": "watcher", "session_id": "s"}]
+        self.reply(turn_events("started the build in the background", extra=bg))
+        later = [{"type": "system", "subtype": "task_notification", "task_id": "t1", "status": "completed", "summary": "ok", "session_id": "s"},
+                 {"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "amb", "task_type": "local_bash", "description": "watcher", "ambient": True}], "session_id": "s"}]
+        (self.dir / "post-0").write_text("".join(json.dumps(e) + "\n" for e in later) + turn_events("build finished: 0 errors"))
+        (self.dir / "postdelay-0").write_text("1.5")
+        status, out = self.post(self.body([{"role": "user", "content": "build it"}]))
+        self.assertEqual(status, 200)
+        self.assertEqual(out["choices"][0]["message"]["content"], "started the build in the background\n\nbuild finished: 0 errors")
+        self.assertGreater(float((self.dir / "0.eof").read_text()), float((self.dir / "0.posted").read_text()))
+
     def test_models_advertise_a_large_window(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/v1/models") as r:
             self.assertEqual(json.load(r)["data"][0]["context_length"], 1000000)
+
+
+class ApprovalRules(unittest.TestCase):
+    BASH = {"tool_name": "Bash", "input": {"command": "ls"}}
+
+    def test_reply_parsing_is_exact(self):
+        for yes in ("y", "yes", " Y ", "YES\n"):
+            self.assertEqual(cb.decide(self.BASH, yes), {"behavior": "allow", "updatedInput": {"command": "ls"}})
+        for no in ("n", "no", " No "):
+            self.assertEqual(cb.decide(self.BASH, no)["behavior"], "deny")
+        self.assertEqual(cb.decide(self.BASH, "yes please"), {"behavior": "deny", "message": "yes please"})
+        self.assertEqual(cb.decide(self.BASH, "  not on prod  "), {"behavior": "deny", "message": "not on prod"})
+
+    def test_question_answers(self):
+        q = {"tool_name": "AskUserQuestion", "input": {"questions": [{"question": "Q?", "options": [{"label": "A"}, {"label": "B"}], "multiSelect": True}]}}
+        self.assertEqual(cb.decide(q, "1, 2")["updatedInput"]["answers"], {"Q?": "A, B"})
+        self.assertEqual(cb.decide(q, "neither, use C")["updatedInput"]["answers"], {"Q?": "neither, use C"})
+
+    def test_long_input_is_truncated(self):
+        text = cb.describe_request({"tool_name": "Bash", "input": {"command": "echo " + "x" * 2000}})
+        self.assertLess(len(text), 700)
+        self.assertIn("…", text)
+
+    def test_only_owner_or_admin_may_answer_and_timeout_denies(self):
+        ap = cb.Approvals()
+        ap.last_poll = time.time()
+        origin = {"platform": "discord", "chat_id": "c", "user_id": "42"}
+        got = {}
+        t = threading.Thread(target=lambda: got.setdefault("d", ap.ask("r", self.BASH, origin, timeout=5)))
+        t.start()
+        for _ in range(50):
+            if "r" in ap.items:
+                break
+            time.sleep(0.02)
+        self.assertEqual(ap.answer("r", "99", "discord", "y")[0], 403)
+        saved = os.environ.get("CLAUDE_BRIDGE_LOGIN_USERS")
+        os.environ["CLAUDE_BRIDGE_LOGIN_USERS"] = "discord:7"
+        try:
+            self.assertEqual(ap.answer("r", "7", "discord", "n"), (200, {"ok": True, "decision": "deny"}))
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_BRIDGE_LOGIN_USERS", None)
+            else:
+                os.environ["CLAUDE_BRIDGE_LOGIN_USERS"] = saved
+        t.join(5)
+        self.assertEqual(got["d"]["behavior"], "deny")
+        self.assertEqual(ap.answer("r", "42", "discord", "y")[0], 404)  # already answered
+        self.assertEqual(ap.ask("r2", self.BASH, origin, timeout=0.2), {"behavior": "deny", "message": "no answer from user"})
+        self.assertEqual(ap.poll(0, 0)[1][-1]["state"], "timeout")
+
+    def test_cancel_returns_none(self):
+        ap = cb.Approvals()
+        ap.last_poll = time.time()
+        threading.Timer(0.2, ap.cancel, args=("r",)).start()
+        self.assertIsNone(ap.ask("r", self.BASH, {"platform": "discord", "chat_id": "c", "user_id": "1"}, timeout=5))
 
 
 def load_login_plugin():
@@ -488,6 +650,57 @@ class LoginRelay(unittest.TestCase):
         self.assertIn("signed in", reply)
         _, reply = dispatch("/login logout")
         self.assertIn("not signed in", reply)
+        loop.call_soon_threadsafe(loop.stop)
+
+    def test_plugin_relays_approvals_and_consumes_the_answer(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), cb.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.mod.BRIDGE = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        sent = []
+
+        class Adapter:
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                sent.append((chat_id, content))
+
+        class Plat:
+            value = "discord"
+        plat = Plat()
+        gw = types.SimpleNamespace(adapters={plat: Adapter()})
+        stop = threading.Event()
+        self.mod._GATEWAY.update(gateway=gw, loop=loop, poller=True)
+        threading.Thread(target=self.mod.poll_approvals, args=(stop, 1), daemon=True).start()
+        cb.APPROVALS.last_poll = time.time()
+        got = {}
+        t = threading.Thread(target=lambda: got.setdefault("d", cb.APPROVALS.ask("pr1", {"tool_name": "Bash", "input": {"command": "make deploy"}}, {"platform": "discord", "chat_id": "c1", "user_id": "42"}, timeout=10)))
+        t.start()
+        for _ in range(100):
+            if any("make deploy" in m for _, m in sent):
+                break
+            time.sleep(0.05)
+        self.assertTrue(any("make deploy" in m for _, m in sent), sent)
+
+        def dispatch(text, uid):
+            src = types.SimpleNamespace(platform=plat, chat_id="c1", user_id=uid, thread_id=None)
+            async def go():
+                return self.mod.on_dispatch(event=types.SimpleNamespace(text=text, source=src), gateway=gw)
+            return asyncio.run_coroutine_threadsafe(go(), loop).result(10)
+
+        os.environ["CLAUDE_BRIDGE_LOGIN_USERS"] = ""
+        self.assertIsNone(dispatch("y", "99"))  # someone else in the chat: not an answer
+        self.assertIsNone(dispatch("/status", "42"))  # slash commands pass through
+        self.assertEqual(dispatch("not today", "42"), {"action": "skip", "reason": "claude approval answer"})
+        t.join(5)
+        self.assertEqual(got["d"], {"behavior": "deny", "message": "not today"})
+        for _ in range(50):
+            if any(m == "Denied." for _, m in sent):
+                break
+            time.sleep(0.05)
+        self.assertIn(("c1", "Denied."), sent)
+        self.assertIsNone(dispatch("hello", "42"))  # nothing pending: normal message
+        stop.set()
+        srv.shutdown()
         loop.call_soon_threadsafe(loop.stop)
 
     def test_login_is_denied_without_allowlist(self):

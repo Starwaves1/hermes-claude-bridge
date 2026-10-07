@@ -25,6 +25,7 @@ from providers.base import OMIT_TEMPERATURE, ProviderProfile
 
 _EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 SESSION_FIELD = "claude_bridge_session"
+ORIGIN_FIELD = "claude_bridge_origin"
 BASE_URL = os.environ.get("CLAUDE_CLI_BRIDGE_BASE_URL", "http://127.0.0.1:8790/v1")
 CHECK_EVERY = 20.0
 
@@ -94,9 +95,19 @@ class _Supervisor:
 SUPERVISOR = _Supervisor(BASE_URL)
 
 
+def _origin() -> dict:
+    """Where the turn came from, so the bridge can ask that person to approve."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return {}
+    o = {k: get_session_env(f"HERMES_SESSION_{k.upper()}", "") for k in ("platform", "chat_id", "thread_id", "user_id")}
+    return {k: str(v) for k, v in o.items() if v} if o.get("platform") and o.get("chat_id") else {}
+
+
 class ClaudeCliProfile(ProviderProfile):
     """Declarative profile plus hooks: `/effort` → top-level reasoning_effort,
-    conversation key → extra_body, bridge kept alive."""
+    conversation key and chat origin → extra_body, bridge kept alive."""
 
     def ensure_bridge(self, force: bool = False) -> None:
         SUPERVISOR.ensure(force)
@@ -109,6 +120,9 @@ class ClaudeCliProfile(ProviderProfile):
         SUPERVISOR.ensure()
         key = context.get("cache_scope_id") or context.get("session_id")
         extra = {SESSION_FIELD: str(key)} if key else {}
+        origin = _origin()
+        if origin:
+            extra[ORIGIN_FIELD] = origin
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
                 return extra, {"reasoning_effort": "low"}
