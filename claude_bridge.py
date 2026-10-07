@@ -73,9 +73,9 @@ FAKE_ERROR = os.environ.get("CLAUDE_BRIDGE_FAKE_ERROR", "")  # test hook: "limit
 
 # Hermes tools Claude Code already has natively; they are not offered twice.
 DEFAULT_DROP_TOOLS = (
-    "terminal", "process_manage", "read_file", "write_file", "patch", "search_files",
+    "terminal", "process", "process_manage", "read_file", "write_file", "patch", "search_files",
     "web_search", "web_extract", "vision_analyze", "execute_code", "delegate_task",
-    "todo_list", "manage_connections",
+    "todo", "todo_list", "manage_connections",
 )
 DROP_TOOLS = _env_list("CLAUDE_BRIDGE_DROP_TOOLS", DEFAULT_DROP_TOOLS) - _env_list("CLAUDE_BRIDGE_KEEP_TOOLS")
 
