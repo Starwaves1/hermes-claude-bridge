@@ -358,7 +358,15 @@ class PluginProfile(unittest.TestCase):
         self.assertEqual(mod.claude_cli.fetch_models(api_key=None, base_url="http://x", timeout=3), ["stub-model"])
         self.assertEqual(calls[0]["timeout"], 3)
 
+    def test_unknown_caller_is_treated_as_fork(self):
+        mod, _ = self._load_plugin()
+        extra = mod.claude_cli.build_extra_body(session_id="s1")
+        self.assertTrue(extra["claude_bridge_session"].startswith("fork:s1:"))
+        self.assertEqual(extra["claude_bridge_fork"], {"parent": "s1"})
+
     def test_conversation_key_and_effort(self):
+        import types
+        agent = types.SimpleNamespace(session_id="s1", _memory_write_origin="")  # found by the plugin's frame walk
         mod, _ = self._load_plugin()
         p = mod.claude_cli
         self.assertEqual(p.build_extra_body(session_id="s1", model="fable"), {"claude_bridge_session": "s1"})

@@ -12,6 +12,7 @@ Never the built-in `anthropic` OAuth provider alongside it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import signal
@@ -86,15 +87,18 @@ class _Supervisor:
     def up(self, timeout: float = 1.0) -> bool:
         return self.health(timeout) is not None
 
-    def authorized(self) -> bool:
+    def authorized(self) -> bool | None:
+        """True/False when the bridge answered; None when it didn't (busy, timeout)."""
         if not self.token:
             return False
         req = urllib.request.Request(self.root + "/v1/approvals?after=0&wait=0", headers={"X-Bridge-Token": self.token})
         try:
             with urllib.request.urlopen(req, timeout=2) as r:
                 return r.status == 200
+        except urllib.error.HTTPError as e:
+            return False if e.code == 401 else None
         except Exception:
-            return False
+            return None
 
     def _replace(self, health: dict) -> bool:
         try:
@@ -133,7 +137,7 @@ class _Supervisor:
                 self.proc.poll()
             health = self.health()
             if health is not None:
-                if self.authorized():
+                if self.authorized() is not False:
                     return
                 try:
                     owner = int(json.loads((_state_dir() / "bridge.pid").read_text()).get("owner") or 0)
@@ -224,6 +228,9 @@ class ClaudeCliProfile(ProviderProfile):
         if not key:
             return {}
         agent = _calling_agent()
+        if agent is None:
+            logging.getLogger(__name__).warning("claude-cli: calling agent not found; treating request as a fork")
+            return {SESSION_FIELD: f"fork:{key}:{secrets.token_hex(4)}", FORK_FIELD: {"parent": str(key)}}
         if _is_fork(agent):
             return {SESSION_FIELD: f"fork:{key}:{id(agent):x}", FORK_FIELD: {"parent": str(key)}}
         extra = {SESSION_FIELD: str(key)}
